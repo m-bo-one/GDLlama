@@ -446,6 +446,10 @@ bool LlamaChat::load(const String &model_path, int n_ctx, int n_threads, int n_g
         }
         if (best != nullptr) {
             params.devices = { best, nullptr };
+            // Read the file rather than map it: the weights are copied to the device and the
+            // read buffer freed, so the process keeps no copy of the file in memory. Mapped,
+            // the whole file stays in the working set, because Windows cannot unmap a part.
+            params.load_mode = LLAMA_LOAD_MODE_NONE;
             chosen_device = std::string(ggml_backend_dev_name(best)) + " (" + ggml_backend_dev_description(best) + ")";
         } else {
             params.n_gpu_layers = 0;
