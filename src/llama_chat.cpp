@@ -1,0 +1,940 @@
+#include "llama_chat.h"
+
+#include <godot_cpp/classes/dir_access.hpp>
+#include <godot_cpp/classes/json.hpp>
+#include <godot_cpp/classes/project_settings.hpp>
+#include <godot_cpp/core/class_db.hpp>
+#include <godot_cpp/variant/callable_method_pointer.hpp>
+#include <godot_cpp/variant/utility_functions.hpp>
+
+#include "ggml-backend.h"
+#include "log.h"
+#include "sampling.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <exception>
+#include <set>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+// The fences below are a try around a turn and a catch around a thread that could not
+// start; compiled without exceptions they are dead code and either fault unwinds into the
+// engine. Refused here rather than discovered on a machine that could not start the thread.
+#if !defined(_CPPUNWIND) && !defined(__EXCEPTIONS) && !defined(__cpp_exceptions)
+#error "llama_chat.cpp needs C++ exceptions: configure with GODOTCPP_DISABLE_EXCEPTIONS=OFF"
+#endif
+
+using namespace godot;
+
+namespace {
+
+// The one sequence the context holds. A second one would need its own prefix bookkeeping.
+constexpr llama_seq_id SEQUENCE = 0;
+
+using clock_type = std::chrono::steady_clock;
+
+double ms_between(clock_type::time_point from, clock_type::time_point to) {
+    return std::chrono::duration<double, std::milli>(to - from).count();
+}
+
+// Takes the busy flag in one atomic step or reports that another path holds it, and gives it
+// back unless the turn was handed on. Reading the flag and raising it separately lets two
+// callers both start a worker, and assigning a thread over a joinable one is std::terminate().
+struct BusyGuard {
+    std::atomic<bool> *held = nullptr;
+
+    explicit BusyGuard(std::atomic<bool> &flag) {
+        bool expected = false;
+        if (flag.compare_exchange_strong(expected, true)) {
+            held = &flag;
+        }
+    }
+
+    ~BusyGuard() {
+        if (held != nullptr) {
+            held->store(false);
+        }
+    }
+
+    BusyGuard(const BusyGuard &) = delete;
+    BusyGuard &operator=(const BusyGuard &) = delete;
+
+    bool taken() const { return held != nullptr; }
+
+    // The flag stays raised and this stops owning it: the delivery on the main thread is
+    // what lowers it, which is what keeps the model taken until the finish has gone out.
+    void hand_on() { held = nullptr; }
+};
+
+std::atomic<bool> verbose_logs{false};
+std::atomic<bool> backends_ready{false};
+std::mutex backends_lock;
+std::string chosen_device;
+
+// llama.cpp's lines below warning level are dropped unless asked for. A continuation line
+// follows the level of the line it continues, or a dropped message leaks its tail.
+void quiet_log(ggml_log_level level, const char *text, void *) {
+    static std::atomic<int> last_level{GGML_LOG_LEVEL_INFO};
+    if (level != GGML_LOG_LEVEL_CONT) {
+        last_level.store((int)level);
+    }
+    const int shown = last_level.load();
+    if (shown == GGML_LOG_LEVEL_ERROR || shown == GGML_LOG_LEVEL_WARN || verbose_logs.load()) {
+        fputs(text, stderr);
+        fflush(stderr);
+    }
+}
+
+// The folder this library was loaded from, which is where ggml looks for its backends. Asked
+// of the OS rather than of the engine, so an exported game and the editor answer the same.
+std::string own_directory() {
+#ifdef _WIN32
+    HMODULE module = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCWSTR)&own_directory, &module);
+    wchar_t buffer[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(module, buffer, MAX_PATH);
+    std::wstring wide(buffer, length);
+    const size_t slash = wide.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        wide.resize(slash);
+    }
+    const int size = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), (int)wide.size(), nullptr, 0, nullptr, nullptr);
+    std::string out((size_t)size, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), (int)wide.size(), &out[0], size, nullptr, nullptr);
+    return out;
+#else
+    Dl_info info;
+    if (dladdr((void *)&own_directory, &info) && info.dli_fname != nullptr) {
+        std::string path = info.dli_fname;
+        const size_t slash = path.find_last_of('/');
+        return slash == std::string::npos ? "." : path.substr(0, slash);
+    }
+    return ".";
+#endif
+}
+
+std::string to_std(const String &text) {
+    const CharString bytes = text.utf8();
+    return std::string(bytes.get_data(), (size_t)bytes.length());
+}
+
+String to_gd(const std::string &text) {
+    return String::utf8(text.c_str(), (int)text.size());
+}
+
+// A value as JSON text: a string is taken as already being one, anything else is encoded.
+std::string json_text(const Variant &value) {
+    if (value.get_type() == Variant::STRING) {
+        return to_std(value);
+    }
+    if (value.get_type() == Variant::NIL) {
+        return std::string();
+    }
+    return to_std(JSON::stringify(value));
+}
+
+// The text of a message's content, whether a string or the list of typed parts the OpenAI
+// shape allows; only text parts are read.
+std::string content_text(const Variant &content) {
+    if (content.get_type() == Variant::STRING) {
+        return to_std(content);
+    }
+    if (content.get_type() == Variant::ARRAY) {
+        std::string out;
+        const Array parts = content;
+        for (int i = 0; i < parts.size(); i++) {
+            if (parts[i].get_type() != Variant::DICTIONARY) {
+                continue;
+            }
+            const Dictionary part = parts[i];
+            if (String(part.get("type", "text")) == "text") {
+                out += to_std(part.get("text", ""));
+            }
+        }
+        return out;
+    }
+    return json_text(content);
+}
+
+bool read_messages(const Array &messages, std::vector<common_chat_msg> &out, String &error) {
+    for (int i = 0; i < messages.size(); i++) {
+        if (messages[i].get_type() != Variant::DICTIONARY) {
+            error = vformat("Message %d is not a Dictionary.", i);
+            return false;
+        }
+        const Dictionary message = messages[i];
+        common_chat_msg msg;
+        msg.role = to_std(message.get("role", "user"));
+        if (msg.role != "system" && msg.role != "user" && msg.role != "assistant" && msg.role != "tool") {
+            error = vformat("Message %d has the role \"%s\"; system, user, assistant and tool are the roles.",
+                    i, to_gd(msg.role));
+            return false;
+        }
+        msg.content = content_text(message.get("content", ""));
+        if (message.has("tool_call_id")) {
+            msg.tool_call_id = to_std(message["tool_call_id"]);
+        }
+        if (message.has("name")) {
+            msg.tool_name = to_std(message["name"]);
+        }
+        if (message.has("reasoning_content")) {
+            msg.reasoning_content = to_std(message["reasoning_content"]);
+        }
+        const Variant calls = message.get("tool_calls", Variant());
+        if (calls.get_type() == Variant::ARRAY) {
+            const Array list = calls;
+            for (int j = 0; j < list.size(); j++) {
+                if (list[j].get_type() != Variant::DICTIONARY) {
+                    continue;
+                }
+                const Dictionary call = list[j];
+                const Dictionary function = call.get("function", Dictionary());
+                common_chat_tool_call made;
+                made.id = to_std(call.get("id", ""));
+                made.name = to_std(function.get("name", ""));
+                made.arguments = json_text(function.get("arguments", "{}"));
+                if (made.arguments.empty()) {
+                    made.arguments = "{}";
+                }
+                msg.tool_calls.push_back(made);
+            }
+        }
+        out.push_back(msg);
+    }
+    return true;
+}
+
+// A declaration in the OpenAI function shape, or the bare function object itself.
+bool read_tools(const Array &tools, std::vector<common_chat_tool> &out, String &error) {
+    for (int i = 0; i < tools.size(); i++) {
+        if (tools[i].get_type() != Variant::DICTIONARY) {
+            error = vformat("Tool %d is not a Dictionary.", i);
+            return false;
+        }
+        Dictionary declaration = tools[i];
+        if (declaration.has("function") && declaration["function"].get_type() == Variant::DICTIONARY) {
+            declaration = declaration["function"];
+        }
+        common_chat_tool tool;
+        tool.name = to_std(declaration.get("name", ""));
+        if (tool.name.empty()) {
+            error = vformat("Tool %d has no name.", i);
+            return false;
+        }
+        tool.description = to_std(declaration.get("description", ""));
+        Variant parameters = declaration.get("parameters", Variant());
+        if (parameters.get_type() == Variant::NIL) {
+            parameters = declaration.get("schema", Dictionary());
+        }
+        tool.parameters = json_text(parameters);
+        if (tool.parameters.empty()) {
+            tool.parameters = "{\"type\":\"object\",\"properties\":{}}";
+        }
+        out.push_back(tool);
+    }
+    return true;
+}
+
+// Where the bytes from `from` stop being whole UTF-8 sequences: the size, or the start of a
+// sequence whose tail has not arrived. A piece cut inside a letter reads as a broken glyph.
+size_t utf8_complete_end(const std::string &text, size_t from) {
+    const size_t size = text.size();
+    for (size_t back = 1; back <= 3 && size >= from + back; back++) {
+        const size_t at = size - back;
+        const unsigned char byte = (unsigned char)text[at];
+        if ((byte & 0xC0) == 0x80) {
+            continue;
+        }
+        size_t need = 1;
+        if ((byte & 0xE0) == 0xC0) {
+            need = 2;
+        } else if ((byte & 0xF0) == 0xE0) {
+            need = 3;
+        } else if ((byte & 0xF8) == 0xF0) {
+            need = 4;
+        }
+        return back >= need ? size : at;
+    }
+    return size;
+}
+
+// The one model file of a folder, so that a model is named by its folder the way a
+// recogniser is, with its licence beside it. A folder holding none or several is refused
+// with the sentence that says so, rather than the first one found being loaded in silence.
+String single_gguf_in(const String &folder) {
+    const PackedStringArray files = DirAccess::get_files_at(folder);
+    PackedStringArray found;
+    for (int i = 0; i < files.size(); i++) {
+        if (files[i].to_lower().ends_with(".gguf")) {
+            found.append(files[i]);
+        }
+    }
+    if (found.size() != 1) {
+        UtilityFunctions::push_error(vformat(
+                "LlamaChat: the folder \"%s\" holds %d .gguf files; it has to hold exactly one.", folder, found.size()));
+        return String();
+    }
+    return folder.path_join(found[0]);
+}
+
+bool ends_with(const std::string &text, const std::string &tail) {
+    return tail.size() <= text.size() && text.compare(text.size() - tail.size(), tail.size(), tail) == 0;
+}
+
+const char *device_type_name(enum ggml_backend_dev_type type) {
+    switch (type) {
+        case GGML_BACKEND_DEVICE_TYPE_CPU:
+            return "cpu";
+        case GGML_BACKEND_DEVICE_TYPE_GPU:
+            return "gpu";
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:
+            return "igpu";
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+            return "accel";
+        default:
+            return "other";
+    }
+}
+
+} // namespace
+
+LlamaChat::~LlamaChat() {
+    unload();
+}
+
+// The backends are opened once for the process, from the folder this library sits in: the
+// CPU variants and the Vulkan backend are separate libraries, and ggml picks the best it
+// can open. Without this llama.cpp reports that no backend is loaded.
+bool LlamaChat::ensure_backends() {
+    std::lock_guard<std::mutex> hold(backends_lock);
+    if (backends_ready.load()) {
+        return true;
+    }
+    llama_log_set(quiet_log, nullptr);
+    common_log_set_verbosity_thold(verbose_logs.load() ? LOG_LEVEL_INFO : LOG_LEVEL_WARN);
+    llama_backend_init();
+    const std::string folder = own_directory();
+    ggml_backend_load_all_from_path(folder.c_str());
+    if (ggml_backend_dev_count() == 0) {
+        UtilityFunctions::push_error(
+                "LlamaChat: no ggml backend library was found beside the extension in \"" + to_gd(folder) + "\".");
+        return false;
+    }
+    backends_ready.store(true);
+    return true;
+}
+
+void LlamaChat::shutdown_backends() {
+    std::lock_guard<std::mutex> hold(backends_lock);
+    if (backends_ready.exchange(false)) {
+        llama_backend_free();
+    }
+}
+
+void LlamaChat::set_verbose(bool on) {
+    verbose_logs.store(on);
+    common_log_set_verbosity_thold(on ? LOG_LEVEL_INFO : LOG_LEVEL_WARN);
+}
+
+// The model and one context for it. A negative layer count puts every layer on the GPU with
+// the most memory; zero keeps the whole model on the CPU. The load waits for a turn in
+// flight, the way unload() does, and the context is warmed up so the first turn's time is
+// the turn's own rather than the backend's pipeline compilation.
+bool LlamaChat::load(const String &model_path, int n_ctx, int n_threads, int n_gpu_layers) {
+    unload();
+    if (!ensure_backends()) {
+        return false;
+    }
+    const auto started = clock_type::now();
+
+    String path = model_path;
+    if (path.begins_with("res://") || path.begins_with("user://")) {
+        path = ProjectSettings::get_singleton()->globalize_path(path);
+    }
+    if (DirAccess::dir_exists_absolute(path)) {
+        path = single_gguf_in(path);
+        if (path.is_empty()) {
+            return false;
+        }
+    }
+
+    common_params params;
+    params.model.path = to_std(path);
+    params.n_ctx = n_ctx > 0 ? n_ctx : 4096;
+    params.n_batch = n_batch;
+    params.n_ubatch = n_batch;
+    params.n_gpu_layers = n_gpu_layers < 0 ? -1 : n_gpu_layers;
+    params.fit_params = false;
+    params.warmup = false;
+    const int threads = n_threads > 0 ? n_threads : std::max(1, (int)std::thread::hardware_concurrency() / 2);
+    params.cpuparams.n_threads = threads;
+    params.cpuparams_batch.n_threads = threads;
+
+    chosen_device = "cpu";
+    // Zero layers on the GPU has to mean the GPU is not used at all: left to itself, ggml
+    // still hands a large prompt batch to a GPU that is present, and a measurement or a
+    // machine whose driver misbehaves gets a "CPU" run that was not one.
+    params.devices = { nullptr };
+    if (params.n_gpu_layers != 0) {
+        // A discrete GPU over an integrated one, and the largest of either: the model is
+        // placed whole on one device rather than split across two by their memory.
+        ggml_backend_dev_t best = nullptr;
+        size_t best_total = 0;
+        bool best_discrete = false;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t device = ggml_backend_dev_get(i);
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                continue;
+            }
+            const bool discrete = type == GGML_BACKEND_DEVICE_TYPE_GPU;
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(device, &free, &total);
+            if (best == nullptr || (discrete && !best_discrete) || (discrete == best_discrete && total > best_total)) {
+                best = device;
+                best_total = total;
+                best_discrete = discrete;
+            }
+        }
+        if (best != nullptr) {
+            params.devices = { best, nullptr };
+            chosen_device = std::string(ggml_backend_dev_name(best)) + " (" + ggml_backend_dev_description(best) + ")";
+        } else {
+            params.n_gpu_layers = 0;
+        }
+    }
+
+    std::lock_guard<std::mutex> hold(model_lock);
+    try {
+        runtime = common_init_from_params(params);
+    } catch (const std::exception &e) {
+        UtilityFunctions::push_error(String("LlamaChat: loading failed: ") + String::utf8(e.what()));
+        runtime.reset();
+        return false;
+    }
+    if (!runtime || runtime->model() == nullptr || runtime->context() == nullptr) {
+        UtilityFunctions::push_error("LlamaChat: the model at \"" + path + "\" could not be loaded.");
+        runtime.reset();
+        return false;
+    }
+    model = runtime->model();
+    ctx = runtime->context();
+    vocab = llama_model_get_vocab(model);
+    try {
+        templates = common_chat_templates_init(model, "");
+    } catch (const std::exception &e) {
+        UtilityFunctions::push_error(String("LlamaChat: the model's chat template could not be read: ") + String::utf8(e.what()));
+        templates.reset();
+        runtime.reset();
+        model = nullptr;
+        ctx = nullptr;
+        vocab = nullptr;
+        return false;
+    }
+    context_tokens = (int)llama_n_ctx(ctx);
+    warm_up(params.n_gpu_layers != 0);
+    cached.clear();
+    kv_tokens.store(0);
+    timings = LlamaTimings();
+    timings.load_ms = ms_between(started, clock_type::now());
+    loaded.store(true);
+    return true;
+}
+
+// A backend builds its kernels for a batch shape the first time it meets one; on Vulkan that
+// is seconds of pipeline compilation, which would otherwise land on the first turn. The
+// widths a turn produces -- a full prompt batch, a short tail, one sampled token -- are
+// decoded once here and thrown away, so the cost sits in load_ms where it belongs.
+void LlamaChat::warm_up(bool every_width) {
+    llama_token filler = llama_vocab_bos(vocab);
+    if (filler == LLAMA_TOKEN_NULL) {
+        filler = llama_vocab_eos(vocab);
+    }
+    if (filler == LLAMA_TOKEN_NULL) {
+        filler = 0;
+    }
+    std::vector<int> widths = { std::min(n_batch, context_tokens - 1), 1 };
+    if (every_width) {
+        widths = { std::min(n_batch, context_tokens - 1), 128, 32, 8, 1 };
+    }
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    for (const int width : widths) {
+        common_batch_clear(batch);
+        for (int i = 0; i < width; i++) {
+            common_batch_add(batch, filler, (llama_pos)i, { SEQUENCE }, i + 1 == width);
+        }
+        llama_decode(ctx, batch);
+        llama_memory_clear(llama_get_memory(ctx), true);
+    }
+    llama_batch_free(batch);
+    llama_synchronize(ctx);
+    llama_perf_context_reset(ctx);
+}
+
+// The worker is stopped and joined and then the lock is taken, in that order: the worker's
+// turn holds the lock, so taking it first would wait on a thread that is waiting to be joined.
+void LlamaChat::unload() {
+    stop_asked.store(true);
+    epoch.fetch_add(1);
+    join_worker();
+    {
+        std::lock_guard<std::mutex> hold(model_lock);
+        loaded.store(false);
+        templates.reset();
+        runtime.reset();
+        model = nullptr;
+        ctx = nullptr;
+        vocab = nullptr;
+        cached.clear();
+        kv_tokens.store(0);
+    }
+    if (owed.exchange(false)) {
+        busy.store(false);
+    }
+    stop_asked.store(false);
+}
+
+bool LlamaChat::is_loaded() const {
+    return loaded.load();
+}
+
+bool LlamaChat::is_busy() const {
+    return busy.load();
+}
+
+bool LlamaChat::generate(const Array &messages, const Array &tools, const Dictionary &options) {
+    BusyGuard guard(busy);
+    if (!guard.taken()) {
+        UtilityFunctions::push_error("LlamaChat: a turn is still running; wait for finished or cancel it.");
+        return false;
+    }
+    if (!loaded.load()) {
+        UtilityFunctions::push_error("LlamaChat: no model is loaded.");
+        return false;
+    }
+
+    LlamaTurn turn;
+    String error;
+    if (!read_messages(messages, turn.inputs.messages, error) || !read_tools(tools, turn.inputs.tools, error)) {
+        UtilityFunctions::push_error("LlamaChat: " + error);
+        return false;
+    }
+    if (turn.inputs.messages.empty()) {
+        UtilityFunctions::push_error("LlamaChat: there is no message to answer.");
+        return false;
+    }
+    turn.inputs.add_generation_prompt = true;
+    turn.inputs.use_jinja = true;
+    turn.inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+    turn.inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    turn.inputs.enable_thinking = (bool)options.get("enable_thinking", false);
+    turn.inputs.parallel_tool_calls = (bool)options.get("parallel_tool_calls", false);
+    if (options.has("json_schema")) {
+        turn.inputs.json_schema = json_text(options["json_schema"]);
+    }
+    turn.temperature = (float)(double)options.get("temperature", 0.7);
+    turn.top_p = (float)(double)options.get("top_p", 0.8);
+    turn.top_k = (int)options.get("top_k", 20);
+    turn.min_p = (float)(double)options.get("min_p", 0.0);
+    turn.max_tokens = (int)options.get("max_tokens", 512);
+    if (turn.max_tokens <= 0) {
+        turn.max_tokens = context_tokens;
+    }
+    if (options.has("seed")) {
+        turn.seed = (uint32_t)(int64_t)options["seed"];
+    }
+
+    join_worker();
+    stop_asked.store(false);
+    // Marked owed before the thread exists: a delivery that raced this line would otherwise
+    // lower the flag first and have the mark set over it afterwards.
+    owed.store(true);
+    // A thread that could not be started answers false with the flag given back, rather than
+    // letting the system error unwind into the engine, which has no handler for one.
+    try {
+        worker = std::thread(&LlamaChat::work, this, std::move(turn), epoch.load());
+    } catch (...) {
+        owed.store(false);
+        UtilityFunctions::push_error("LlamaChat: the worker thread could not be started.");
+        return false;
+    }
+    guard.hand_on();
+    return true;
+}
+
+// Never blocks: the flag is read by the worker before every token, and the finish it then
+// delivers carries "cancelled". What was decoded stays in the context for the next turn.
+void LlamaChat::cancel() {
+    if (busy.load()) {
+        stop_asked.store(true);
+    }
+}
+
+Dictionary LlamaChat::last_timings() const {
+    Dictionary out;
+    out["load_ms"] = timings.load_ms;
+    out["template_ms"] = timings.template_ms;
+    out["prompt_ms"] = timings.prompt_ms;
+    out["first_piece_ms"] = timings.first_piece_ms;
+    out["generate_ms"] = timings.generate_ms;
+    out["total_ms"] = timings.total_ms;
+    out["prompt_tokens"] = timings.prompt_tokens;
+    out["reused_tokens"] = timings.reused_tokens;
+    out["decoded_tokens"] = timings.decoded_tokens;
+    out["completion_tokens"] = timings.completion_tokens;
+    const double prompt_seconds = timings.prompt_ms / 1000.0;
+    const double generate_seconds = timings.generate_ms / 1000.0;
+    out["prompt_tokens_per_second"] = prompt_seconds > 0.0 ? timings.decoded_tokens / prompt_seconds : 0.0;
+    out["tokens_per_second"] = generate_seconds > 0.0 ? timings.completion_tokens / generate_seconds : 0.0;
+    out["device"] = to_gd(chosen_device);
+    out["context_size"] = context_tokens;
+    return out;
+}
+
+int LlamaChat::context_size() const {
+    return context_tokens;
+}
+
+int LlamaChat::cached_tokens() const {
+    return kv_tokens.load();
+}
+
+Array LlamaChat::describe_devices() {
+    Array out;
+    if (!ensure_backends()) {
+        return out;
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t device = ggml_backend_dev_get(i);
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(device, &free, &total);
+        Dictionary entry;
+        entry["name"] = String::utf8(ggml_backend_dev_name(device));
+        entry["description"] = String::utf8(ggml_backend_dev_description(device));
+        entry["type"] = device_type_name(ggml_backend_dev_type(device));
+        entry["memory_total_mb"] = (int64_t)(total / (1024 * 1024));
+        entry["memory_free_mb"] = (int64_t)(free / (1024 * 1024));
+        out.push_back(entry);
+    }
+    return out;
+}
+
+// The worker's whole life. An exception out of the turn is turned into a failure delivered
+// on the main thread, where it would otherwise end the process.
+void LlamaChat::work(LlamaTurn turn, int64_t at) {
+    try {
+        run_turn(turn, at);
+    } catch (const std::exception &e) {
+        callable_mp(this, &LlamaChat::deliver_failed).call_deferred(at, String("LlamaChat: ") + String::utf8(e.what()));
+    } catch (...) {
+        callable_mp(this, &LlamaChat::deliver_failed).call_deferred(at, String("LlamaChat: the turn failed with an unknown error."));
+    }
+}
+
+// One turn: render, tokenize, drop the context past the first token that differs from what
+// it holds, decode the rest, then sample under the template's grammar until the model stops,
+// the budget runs out or cancel() is seen. Every piece of visible text goes out as soon as
+// its last letter is whole; calls go out once the reply has ended cleanly.
+void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
+    auto fail = [&](const String &message) {
+        callable_mp(this, &LlamaChat::deliver_failed).call_deferred(at, message);
+    };
+
+    std::lock_guard<std::mutex> hold(model_lock);
+    if (!loaded.load() || at != epoch.load()) {
+        fail("LlamaChat: the model was unloaded before the turn started.");
+        return;
+    }
+    const auto started = clock_type::now();
+    LlamaTimings cost;
+    cost.load_ms = timings.load_ms;
+
+    common_chat_params chat;
+    try {
+        chat = common_chat_templates_apply(templates.get(), turn.inputs);
+    } catch (const std::exception &e) {
+        fail(String("LlamaChat: the chat template refused the messages: ") + String::utf8(e.what()));
+        return;
+    }
+
+    const llama_tokens prompt = common_tokenize(vocab, chat.prompt, true, true);
+    cost.template_ms = ms_between(started, clock_type::now());
+    if (prompt.empty()) {
+        fail("LlamaChat: the rendered prompt is empty.");
+        return;
+    }
+    if ((int)prompt.size() + 1 > context_tokens) {
+        fail(vformat("LlamaChat: the prompt is %d tokens and the context holds %d.", (int)prompt.size(), context_tokens));
+        return;
+    }
+
+    // The prefix already decoded is kept; when the whole prompt is there the last token is
+    // decoded again, because a turn needs the logits of its final token to sample from.
+    size_t keep = 0;
+    while (keep < cached.size() && keep < prompt.size() && cached[keep] == prompt[keep]) {
+        keep++;
+    }
+    if (keep == prompt.size()) {
+        keep--;
+    }
+    llama_memory_t memory = llama_get_memory(ctx);
+    if (keep == 0) {
+        llama_memory_clear(memory, true);
+    } else {
+        llama_memory_seq_rm(memory, SEQUENCE, (llama_pos)keep, -1);
+    }
+    cached.resize(keep);
+    kv_tokens.store((int)cached.size());
+    cost.prompt_tokens = (int)prompt.size();
+    cost.reused_tokens = (int)keep;
+    cost.decoded_tokens = (int)(prompt.size() - keep);
+
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    struct BatchFree {
+        llama_batch &batch;
+        ~BatchFree() { llama_batch_free(batch); }
+    } batch_free{ batch };
+
+    const auto prompt_started = clock_type::now();
+    for (size_t from = keep; from < prompt.size();) {
+        if (stop_asked.load()) {
+            cost.total_ms = ms_between(started, clock_type::now());
+            timings = cost;
+            callable_mp(this, &LlamaChat::deliver_finished).call_deferred(at, String("cancelled"), (int)prompt.size(), 0);
+            return;
+        }
+        const size_t to = std::min(prompt.size(), from + (size_t)n_batch);
+        common_batch_clear(batch);
+        for (size_t i = from; i < to; i++) {
+            common_batch_add(batch, prompt[i], (llama_pos)i, { SEQUENCE }, i + 1 == prompt.size());
+        }
+        if (llama_decode(ctx, batch) != 0) {
+            fail("LlamaChat: the prompt could not be decoded; the context may be too small for it.");
+            return;
+        }
+        for (size_t i = from; i < to; i++) {
+            cached.push_back(prompt[i]);
+        }
+        kv_tokens.store((int)cached.size());
+        from = to;
+    }
+    cost.prompt_ms = ms_between(prompt_started, clock_type::now());
+
+    // The sampler carries the template's grammar: lazy, opened by the trigger words, so
+    // speech is free and a call is constrained to the declared schemas.
+    common_params_sampling sampling;
+    sampling.seed = turn.seed;
+    sampling.temp = turn.temperature;
+    sampling.top_p = turn.top_p;
+    sampling.top_k = turn.top_k;
+    sampling.min_p = turn.min_p;
+    if (!chat.grammar.empty()) {
+        const common_grammar_type kind =
+                turn.inputs.tools.empty() ? COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT : COMMON_GRAMMAR_TYPE_TOOL_CALLS;
+        sampling.grammar = common_grammar(kind, chat.grammar);
+        sampling.grammar_lazy = chat.grammar_lazy;
+        sampling.grammar_triggers = chat.grammar_triggers;
+    }
+    sampling.generation_prompt = chat.generation_prompt;
+    std::set<llama_token> preserved;
+    for (const std::string &word : chat.preserved_tokens) {
+        const llama_tokens ids = common_tokenize(vocab, word, false, true);
+        if (ids.size() == 1) {
+            preserved.insert(ids[0]);
+        }
+    }
+    sampling.preserved_tokens = preserved;
+    common_sampler_ptr sampler(common_sampler_init(model, sampling));
+    if (!sampler) {
+        fail("LlamaChat: the sampler could not be built from the template's grammar.");
+        return;
+    }
+
+    common_chat_parser_params parsing(chat);
+    parsing.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    parsing.parse_tool_calls = true;
+    if (!chat.parser.empty()) {
+        try {
+            parsing.parser.load(chat.parser);
+        } catch (const std::exception &e) {
+            fail(String("LlamaChat: the template's parser could not be loaded: ") + String::utf8(e.what()));
+            return;
+        }
+    }
+
+    std::string generated;
+    std::string visible;
+    size_t sent = 0;
+    common_chat_msg parsed;
+    std::vector<std::string> ids_cache;
+    auto mint_id = [this]() { return "call_" + std::to_string(++call_serial); };
+    bool first_piece = true;
+
+    // What the parser now takes the reply to be, diffed against the last reading so that only
+    // new visible text is queued; a reading that fails keeps the previous one.
+    auto reread = [&](bool is_partial) {
+        try {
+            common_chat_msg reading = common_chat_parse(generated, is_partial, parsing);
+            if (reading.empty()) {
+                return;
+            }
+            reading.set_tool_call_ids(ids_cache, mint_id);
+            for (const common_chat_msg_diff &diff : common_chat_msg_diff::compute_diffs(parsed, reading)) {
+                visible += diff.content_delta;
+            }
+            parsed = reading;
+        } catch (const std::exception &) {
+            if (!is_partial) {
+                parsed.content = generated;
+                visible = generated;
+            }
+        }
+    };
+
+    auto flush = [&]() {
+        const size_t end = utf8_complete_end(visible, sent);
+        if (end > sent) {
+            if (first_piece) {
+                first_piece = false;
+                cost.first_piece_ms = ms_between(started, clock_type::now());
+            }
+            callable_mp(this, &LlamaChat::deliver_piece).call_deferred(at, String::utf8(visible.data() + sent, (int)(end - sent)));
+            sent = end;
+        }
+    };
+
+    std::string reason = "stop";
+    int produced = 0;
+    const auto generate_started = clock_type::now();
+    for (;;) {
+        if (stop_asked.load()) {
+            reason = "cancelled";
+            break;
+        }
+        if (produced >= turn.max_tokens || (int)cached.size() + 1 >= context_tokens) {
+            reason = "length";
+            break;
+        }
+        const llama_token token = common_sampler_sample(sampler.get(), ctx, -1);
+        common_sampler_accept(sampler.get(), token, true);
+        if (llama_vocab_is_eog(vocab, token)) {
+            break;
+        }
+        produced++;
+        generated += common_token_to_piece(vocab, token, preserved.count(token) > 0);
+        reread(true);
+        flush();
+
+        bool stopped = false;
+        for (const std::string &stop : chat.additional_stops) {
+            if (!stop.empty() && ends_with(generated, stop)) {
+                stopped = true;
+            }
+        }
+        common_batch_clear(batch);
+        common_batch_add(batch, token, (llama_pos)cached.size(), { SEQUENCE }, true);
+        if (llama_decode(ctx, batch) != 0) {
+            fail("LlamaChat: a generated token could not be decoded; the context is full.");
+            return;
+        }
+        cached.push_back(token);
+        kv_tokens.store((int)cached.size());
+        if (stopped) {
+            break;
+        }
+    }
+    cost.generate_ms = ms_between(generate_started, clock_type::now());
+
+    // The final reading is whole only for a reply the model ended itself. A cut reply keeps
+    // its partial reading, and its unfinished calls are never announced.
+    reread(reason != "stop");
+    flush();
+    if (reason == "stop") {
+        for (const common_chat_tool_call &call : parsed.tool_calls) {
+            callable_mp(this, &LlamaChat::deliver_call)
+                    .call_deferred(at, to_gd(call.id), to_gd(call.name), to_gd(call.arguments));
+        }
+        if (!parsed.tool_calls.empty()) {
+            reason = "tool_calls";
+        }
+    }
+
+    cost.completion_tokens = produced;
+    cost.total_ms = ms_between(started, clock_type::now());
+    timings = cost;
+    callable_mp(this, &LlamaChat::deliver_finished).call_deferred(at, to_gd(reason), (int)prompt.size(), produced);
+}
+
+// The deliveries, on the main thread. A turn whose model was unloaded or replaced while it
+// ran is dropped: the flag it would clear belongs to whatever was started after it.
+void LlamaChat::deliver_piece(int64_t at, const String &text) {
+    if (at != epoch.load()) {
+        return;
+    }
+    emit_signal("piece_arrived", text);
+}
+
+void LlamaChat::deliver_call(int64_t at, const String &id, const String &name, const String &arguments) {
+    if (at != epoch.load()) {
+        return;
+    }
+    emit_signal("tool_called", id, name, arguments);
+}
+
+void LlamaChat::deliver_finished(int64_t at, const String &reason, int prompt_tokens, int completion_tokens) {
+    if (at != epoch.load() || !busy.load()) {
+        return;
+    }
+    owed.store(false);
+    busy.store(false);
+    emit_signal("finished", reason, prompt_tokens, completion_tokens);
+}
+
+void LlamaChat::deliver_failed(int64_t at, const String &message) {
+    if (at != epoch.load() || !busy.load()) {
+        return;
+    }
+    owed.store(false);
+    busy.store(false);
+    emit_signal("failed", message);
+}
+
+void LlamaChat::join_worker() {
+    if (worker.joinable()) {
+        worker.join();
+    }
+}
+
+void LlamaChat::_bind_methods() {
+    ClassDB::bind_method(D_METHOD("load", "model_path", "n_ctx", "n_threads", "n_gpu_layers"), &LlamaChat::load);
+    ClassDB::bind_method(D_METHOD("unload"), &LlamaChat::unload);
+    ClassDB::bind_method(D_METHOD("is_loaded"), &LlamaChat::is_loaded);
+    ClassDB::bind_method(D_METHOD("is_busy"), &LlamaChat::is_busy);
+    ClassDB::bind_method(D_METHOD("generate", "messages", "tools", "options"), &LlamaChat::generate);
+    ClassDB::bind_method(D_METHOD("cancel"), &LlamaChat::cancel);
+    ClassDB::bind_method(D_METHOD("last_timings"), &LlamaChat::last_timings);
+    ClassDB::bind_method(D_METHOD("context_size"), &LlamaChat::context_size);
+    ClassDB::bind_method(D_METHOD("cached_tokens"), &LlamaChat::cached_tokens);
+    ClassDB::bind_method(D_METHOD("describe_devices"), &LlamaChat::describe_devices);
+    ClassDB::bind_static_method("LlamaChat", D_METHOD("set_verbose", "on"), &LlamaChat::set_verbose);
+
+    ADD_SIGNAL(MethodInfo("piece_arrived", PropertyInfo(Variant::STRING, "text")));
+    ADD_SIGNAL(MethodInfo("tool_called", PropertyInfo(Variant::STRING, "id"), PropertyInfo(Variant::STRING, "name"),
+            PropertyInfo(Variant::STRING, "arguments_json")));
+    ADD_SIGNAL(MethodInfo("finished", PropertyInfo(Variant::STRING, "reason"), PropertyInfo(Variant::INT, "prompt_tokens"),
+            PropertyInfo(Variant::INT, "completion_tokens")));
+    ADD_SIGNAL(MethodInfo("failed", PropertyInfo(Variant::STRING, "message")));
+}

@@ -1,0 +1,48 @@
+[configuration]
+entry_symbol = "llama_chat_library_init"
+compatibility_minimum = "4.5"
+reloadable = false
+
+[libraries]
+windows.debug.x86_64 = "bin/libllama_chat.windows.template_debug.x86_64.dll"
+windows.release.x86_64 = "bin/libllama_chat.windows.template_release.x86_64.dll"
+linux.debug.x86_64 = "bin/libllama_chat.linux.template_debug.x86_64.so"
+linux.release.x86_64 = "bin/libllama_chat.linux.template_release.x86_64.so"
+
+; Everything the extension opens at run time. The core four are imported by name; the CPU
+; variants and the Vulkan backend are found by ggml in the extension's own folder, so they
+; have to be exported beside it, which is what listing them here makes the exporter do.
+; The variants are the ten MSVC builds; a clang build adds five more and would list them.
+[dependencies]
+windows.debug.x86_64 = {
+"bin/ggml-base.dll": "",
+"bin/ggml.dll": "",
+"bin/llama.dll": "",
+"bin/llama-common.dll": "",
+"bin/ggml-vulkan.dll": "",
+"bin/ggml-cpu-x64.dll": "",
+"bin/ggml-cpu-sse42.dll": "",
+"bin/ggml-cpu-sandybridge.dll": "",
+"bin/ggml-cpu-haswell.dll": "",
+"bin/ggml-cpu-skylakex.dll": "",
+"bin/ggml-cpu-cannonlake.dll": "",
+"bin/ggml-cpu-cascadelake.dll": "",
+"bin/ggml-cpu-icelake.dll": "",
+"bin/ggml-cpu-alderlake.dll": ""
+}
+windows.release.x86_64 = {
+"bin/ggml-base.dll": "",
+"bin/ggml.dll": "",
+"bin/llama.dll": "",
+"bin/llama-common.dll": "",
+"bin/ggml-vulkan.dll": "",
+"bin/ggml-cpu-x64.dll": "",
+"bin/ggml-cpu-sse42.dll": "",
+"bin/ggml-cpu-sandybridge.dll": "",
+"bin/ggml-cpu-haswell.dll": "",
+"bin/ggml-cpu-skylakex.dll": "",
+"bin/ggml-cpu-cannonlake.dll": "",
+"bin/ggml-cpu-cascadelake.dll": "",
+"bin/ggml-cpu-icelake.dll": "",
+"bin/ggml-cpu-alderlake.dll": ""
+}

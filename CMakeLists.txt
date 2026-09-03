@@ -1,314 +1,109 @@
-# ============================================================================
-# Basic Configuration
-# ============================================================================
-message("Starting CMake configuration for godot_llm")
-# Minimum of 3.14 for:
-# - `add_link_options`
-# - implicit target dirs
-cmake_minimum_required(VERSION 3.14)
-project("godot_llm" C CXX)
-
-include(CTest)
+# The GDExtension around llama.cpp: one shared library, LlamaChat, beside the llama.cpp and
+# ggml shared libraries it links, with every ggml backend built as its own library and picked
+# at run time. Vulkan is not built here: its shaders need the Vulkan SDK, and the prebuilt
+# ggml-vulkan of the same llama.cpp tag is dropped beside the others instead (see README.md).
+cmake_minimum_required(VERSION 3.22)
+project(llama_chat C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED True)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL$<$<CONFIG:Debug>:Debug>")
+# One C runtime, dynamically linked, shared with the prebuilt Vulkan backend and with the
+# rest of the llama.cpp release binaries. A static runtime here would give ggml two heaps.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
-# For macOS, build a universal binary that runs on both x86_64 and arm64 (Apple Silicon)
-if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
-    SET(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "Build architectures for OSX" FORCE)
-endif ()
-
-# ============================================================================
-# Platform and Compiler Settings
-# ============================================================================
 if (MSVC)
-  # Disable MSVC fopen warning
-  add_definitions(-D_CRT_SECURE_NO_WARNINGS)
-
-  # Fix debug build iterator bound check bug:
-  # https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector
-  add_definitions(-D_ITERATOR_DEBUG_LEVEL=0)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+  add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/utf-8>" "$<$<COMPILE_LANGUAGE:CXX>:/EHsc>")
 endif()
 
-if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-  if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
-    # A small attempt to keep the build output clean.
-    add_compile_options(
-      /vmg
-      /vmv
-      -Wno-c++98-compat
-      -Wno-c++98-compat-pedantic
-      -Wno-double-promotion
-      -Wno-old-style-cast
-      -Wno-implicit-float-conversion
-      -Wno-unsafe-buffer-usage
-      -Wno-unused-function
-      -Wno-unused-command-line-argument
-      -Wno-newline-eof
-      -Wno-float-equal
-      -Wno-unknown-argument
-      -Wno-shorten-64-to-32
-      -Wno-sign-conversion
-      -Wno-float-conversion
-      -Wno-cast-align
-      -Wno-cast-qual
-      -Wno-extra-semi-stmt
-      -Wno-cast-function-type-strict
-      -Wno-implicit-int-conversion
-      -Wno-missing-prototypes
-      -Wno-switch-default
-      -Wno-exit-time-destructors
-      -Wno-covered-switch-default
-      -Wno-global-constructors
-      "$<$<CONFIG:Debug>:-fstandalone-debug>"
-    )
-
-    if (DEFINED ENV{CI})
-      message(STATUS "In a CI environment, adding -Wno-character-conversion")
-      add_compile_options(-Wno-character-conversion)
-    endif()
-  endif()
-endif()
-
-if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  add_compile_options(-fPIC)
-endif()
-
-# ============================================================================
-# Dependencies
-# ============================================================================
-
+# ---------------------------------------------------------------------------------------------
+# godot-cpp, static. Exceptions stay on: the worker thread fences llama.cpp with try/catch,
+# and the chat template code throws on a malformed message.
+# ---------------------------------------------------------------------------------------------
+set(BUILD_SHARED_LIBS OFF)
+set(GODOTCPP_TARGET "template_debug" CACHE STRING "template_debug or template_release")
+set(GODOTCPP_DISABLE_EXCEPTIONS OFF CACHE BOOL "" FORCE)
 add_subdirectory(godot-cpp)
-set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};${godot-cpp_SOURCE_DIR}/cmake")
-include(GodotCPPModule)
 
-set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
-set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+# ---------------------------------------------------------------------------------------------
+# llama.cpp, shared, with dynamically loaded backends and every CPU variant, so that the same
+# build runs on any x86-64 and picks the widest instruction set the machine has.
+# ---------------------------------------------------------------------------------------------
+set(BUILD_SHARED_LIBS ON)
+set(GGML_BACKEND_DL ON)
+set(GGML_CPU_ALL_VARIANTS ON)
+set(GGML_NATIVE OFF)
+set(GGML_OPENMP OFF)
+set(GGML_VULKAN OFF)
+set(LLAMA_BUILD_COMMON ON)
+set(LLAMA_BUILD_TOOLS OFF)
+set(LLAMA_BUILD_EXAMPLES OFF)
+set(LLAMA_BUILD_TESTS OFF)
+set(LLAMA_BUILD_SERVER OFF)
+set(LLAMA_BUILD_APP OFF)
+set(LLAMA_OPENSSL OFF)
+set(LLAMA_SUBPROCESS OFF)
+set(LLAMA_ALL_WARNINGS OFF)
 add_subdirectory(llama.cpp)
 
-# ===========================================================================
-# Logging Configuration
-# ===========================================================================
-option(GDLLAMA_DEBUG_LOGGING "Enable verbose debug level logging" OFF)
+# ---------------------------------------------------------------------------------------------
+# The extension
+# ---------------------------------------------------------------------------------------------
+string(TOLOWER "${CMAKE_SYSTEM_NAME}" LLAMA_CHAT_PLATFORM)
+if (LLAMA_CHAT_PLATFORM STREQUAL "darwin")
+  set(LLAMA_CHAT_PLATFORM "macos")
+endif()
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  set(LLAMA_CHAT_ARCH "x86_64")
+elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+  set(LLAMA_CHAT_ARCH "arm64")
+else()
+  set(LLAMA_CHAT_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+endif()
 
-# ============================================================================
-# Target Library (libgodot_llm)
-# ============================================================================
-set(src_files
-  "src/conversion.cpp"
-  "src/gdllama.cpp"
-  "src/llama_runner.cpp"
-  "src/register_types.cpp"
-  "src/logging_utils.cpp"
-  "src/llama_controller.cpp"
-  "src/llama_state.cpp"
+add_library(llama_chat SHARED
+  src/llama_chat.cpp
+  src/register_types.cpp
 )
-
-string(TOLOWER ${CMAKE_SYSTEM_NAME} SYSTEM_NAME_LOWER)
-
-set(CMAKE_STATIC_LIBRARY_PREFIX "")
-set(CMAKE_SHARED_LIBRARY_PREFIX "")
-
+target_link_libraries(llama_chat PRIVATE godot::cpp llama-common llama)
+set_target_properties(llama_chat PROPERTIES
+  PREFIX ""
+  OUTPUT_NAME "libllama_chat.${LLAMA_CHAT_PLATFORM}.${GODOTCPP_TARGET}.${LLAMA_CHAT_ARCH}"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
 if (APPLE)
-  set(ARCH_SUFFIX "universal")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-  set(ARCH_SUFFIX "amd64")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
-  set(ARCH_SUFFIX "aarch64")
-else()
-  set(ARCH_SUFFIX ${CMAKE_SYSTEM_PROCESSOR})
+  set_target_properties(llama_chat PROPERTIES INSTALL_RPATH "@loader_path" BUILD_WITH_INSTALL_RPATH TRUE)
+elseif (UNIX)
+  set_target_properties(llama_chat PROPERTIES INSTALL_RPATH "$ORIGIN" BUILD_WITH_INSTALL_RPATH TRUE)
 endif()
 
-set(LIB_NAME godot_llm)
+# ---------------------------------------------------------------------------------------------
+# Install: the folder a Godot project takes as addons/llm. Everything the extension loads at
+# run time lands in bin/, the prebuilt Vulkan backend included when its path is given.
+# ---------------------------------------------------------------------------------------------
+set(LLAMA_CHAT_VULKAN_DLL "" CACHE FILEPATH "prebuilt ggml-vulkan shared library to ship beside the others")
+set(LLAMA_CHAT_INSTALL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/install/addons/llm")
 
-add_library(${LIB_NAME} SHARED ${src_files})
+# llama.cpp installs its own headers and libraries under the prefix whatever the caller wants;
+# pointed into the build tree so that the only install that reaches the source tree is the
+# addon folder below, whose destinations are absolute.
+set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/install-prefix" CACHE PATH "" FORCE)
 
-if (GDLLAMA_DEBUG_LOGGING)
-  message(STATUS "Enabling GDLlama debug logging")
-  target_compile_definitions(${LIB_NAME} PRIVATE GDLLAMA_ENABLE_DEBUG_LOGS)
+install(TARGETS llama_chat
+  RUNTIME DESTINATION "${LLAMA_CHAT_INSTALL_DIR}/bin"
+  LIBRARY DESTINATION "${LLAMA_CHAT_INSTALL_DIR}/bin"
+)
+install(DIRECTORY "${CMAKE_BINARY_DIR}/bin/"
+  DESTINATION "${LLAMA_CHAT_INSTALL_DIR}/bin"
+  FILES_MATCHING
+    PATTERN "ggml*${CMAKE_SHARED_LIBRARY_SUFFIX}"
+    PATTERN "llama*${CMAKE_SHARED_LIBRARY_SUFFIX}"
+    PATTERN "libggml*${CMAKE_SHARED_LIBRARY_SUFFIX}*"
+    PATTERN "libllama*${CMAKE_SHARED_LIBRARY_SUFFIX}*"
+)
+if (LLAMA_CHAT_VULKAN_DLL)
+  install(FILES "${LLAMA_CHAT_VULKAN_DLL}" DESTINATION "${LLAMA_CHAT_INSTALL_DIR}/bin")
 endif()
-
-if(APPLE)
-  set_target_properties(${LIB_NAME} PROPERTIES
-    INSTALL_RPATH "@loader_path"
-    BUILD_WITH_INSTALL_RPATH TRUE
-  )
-elseif(UNIX)
-  set_target_properties(${LIB_NAME} PROPERTIES
-    INSTALL_RPATH "$ORIGIN"
-    BUILD_WITH_INSTALL_RPATH TRUE
-  )
-endif()
-
-set_target_properties(${LIB_NAME} PROPERTIES
-    OUTPUT_NAME "libgodot_llm"
-    DEBUG_POSTFIX ".${SYSTEM_NAME_LOWER}.debug.${ARCH_SUFFIX}"
-    RELEASE_POSTFIX ".${SYSTEM_NAME_LOWER}.release.${ARCH_SUFFIX}"
-    MINSIZEREL_POSTFIX ".${SYSTEM_NAME_LOWER}.minsizerel.${ARCH_SUFFIX}"
-    RELWITHDEBINFO_POSTFIX ".${SYSTEM_NAME_LOWER}.relwithdebinfo.${ARCH_SUFFIX}"
-)
-
-target_link_libraries(${LIB_NAME} PRIVATE godot-cpp common llama)
-
-target_include_directories(${LIB_NAME}
-  PUBLIC
-    include
-  PRIVATE
-    llama.cpp
-    llama.cpp/common
-    llama.cpp/src
-    llama.cpp/vendor
-)
-
-# ============================================================================
-# Documentation
-# ============================================================================
-get_target_property(GODOTCPP_TARGET godot::cpp GODOTCPP_TARGET)
-
-file(
-  GLOB_RECURSE DOC_XML
-  LIST_DIRECTORIES NO 
-  CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/plugin/doc_classes/*.xml"
-)
-
-if(DOC_XML)
-  message(STATUS "Found documentation files: ${DOC_XML}")
-  if(GODOTCPP_TARGET MATCHES "editor|template_debug")
-    target_doc_sources(${LIB_NAME} ${DOC_XML})
-    message(STATUS "Documentation embedded for target: ${GODOTCPP_TARGET}")
-  else()
-    message(STATUS "Skipping documentation (target: ${GODOTCPP_TARGET})")
-  endif()
-endif()
-
-# ============================================================================
-# Testing
-# ============================================================================
-if (BUILD_TESTING)
-  enable_testing()
-  include(FetchContent)
-
-  FetchContent_Declare(
-    googletest
-    URL https://github.com/google/googletest/archive/03597a01ee50ed33e9dfd640b249b4be3799d395.zip # v1.14.0
-    DOWNLOAD_EXTRACT_TIMESTAMP true 
-  )
-
-  # For Windows: Prevent gtest from overriding /MT /MD settings
-  set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(googletest)
-
-  add_library(godot_llm_test_lib STATIC
-    src/conversion.cpp
-    src/logging_utils.cpp
-    src/llama_controller.cpp
-    src/llama_state.cpp
-    src/llama_runner.cpp
-  )
-
-  target_compile_definitions(godot_llm_test_lib PRIVATE LOG_DISABLE_LOGS)
-
-  target_include_directories(godot_llm_test_lib PUBLIC
-    include
-    godot-cpp
-    godot-cpp/include
-    godot-cpp/gdextension/include
-    godot-cpp/gen/include 
-    llama.cpp
-    llama.cpp/include
-    llama.cpp/common
-    llama.cpp/src
-    llama.cpp/vendor
-    llama.cpp/ggml/src
-    llama.cpp/ggml/include
-  )
-
-  target_link_libraries(godot_llm_test_lib PUBLIC
-    godot-cpp
-    common
-    llama
-  )
-
-  add_executable(run_tests
-    tests/main.cpp
-    tests/test_llama_state.cpp
-    tests/test_llama_controller.cpp
-  )
-
-  target_link_libraries(run_tests PRIVATE
-    gtest_main
-    godot_llm_test_lib
-  )
-
-  if (WIN32)
-    add_custom_command(TARGET run_tests POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        $<TARGET_FILE:gtest>
-        $<TARGET_FILE:ggml-base>
-        $<TARGET_FILE:ggml>
-        $<TARGET_FILE:ggml-cpu>
-        $<TARGET_FILE:llama>
-        $<TARGET_FILE_DIR:run_tests>
-      COMMENT "Copying DLLs to test directory"
-    )
-  endif()
-
-  add_custom_command(TARGET run_tests POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E create_symlink
-      ${CMAKE_SOURCE_DIR}/tests
-      ${CMAKE_BINARY_DIR}/tests
-    COMMENT "Creating symlink to tests directory"
-  )
-
-  add_test(NAME run_tests COMMAND run_tests)
-endif()
-
-# ============================================================================
-# Install Rules
-# ============================================================================
-set(CMAKE_INSTALL_PREFIX ${CMAKE_CURRENT_SOURCE_DIR}/install)
-
-if (LLAMA_VULKAN OR LLAMA_METAL)
-  set(LLM_LIB_INSTALL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/install/gpu/addons/godot_llm)
-  message(STATUS "Configuring GPU build install to: ${LLM_LIB_INSTALL_DIR}")
-else()
-  set(LLM_LIB_INSTALL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/install/cpu/addons/godot_llm)
-  message(STATUS "Configuring CPU build install to: ${LLM_LIB_INSTALL_DIR}")
-endif()
-
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/plugin/godot_llm.gdextension" GDEXTENSION_CONTENT)
-string(REPLACE "@POSTFIX_TYPE@" "$<LOWER_CASE:$<CONFIG>>" GDEXTENSION_CONTENT "${GDEXTENSION_CONTENT}")
-file(GENERATE
-  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/godot_llm.gdextension"
-  CONTENT "${GDEXTENSION_CONTENT}"
-)
-
-# Install the base gdextension
-install(TARGETS ${LIB_NAME}
-  RUNTIME DESTINATION ${LLM_LIB_INSTALL_DIR}/bin  # .dll on Windows
-  LIBRARY DESTINATION ${LLM_LIB_INSTALL_DIR}/bin  # .so/.dylib on Unix
-  ARCHIVE DESTINATION ${LLM_LIB_INSTALL_DIR}/bin  # .lib/.a
-)
-
-# Install shared library dependencies
-install(FILES
-  $<TARGET_FILE:ggml-base>
-  $<TARGET_FILE:ggml>
-  $<TARGET_FILE:ggml-cpu>
-  $<TARGET_FILE:llama>
-  DESTINATION ${LLM_LIB_INSTALL_DIR}/bin
-)
-
-# Install plugin bits
-install(
-  FILES
-  "${CMAKE_CURRENT_BINARY_DIR}/godot_llm.gdextension"
-  "plugin/plugin.cfg"
-  "plugin/plugin.gd"
-  "plugin/icon.png"
-  DESTINATION ${LLM_LIB_INSTALL_DIR}
-)
-
-message(STATUS "Install directory configured: ${LLM_LIB_INSTALL_DIR}")
+install(FILES "plugin/llama_chat.gdextension" DESTINATION "${LLAMA_CHAT_INSTALL_DIR}")
