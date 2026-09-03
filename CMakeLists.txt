@@ -64,6 +64,7 @@ endif()
 
 add_library(llama_chat SHARED
   src/llama_chat.cpp
+  src/llama_runtime.cpp
   src/register_types.cpp
 )
 target_link_libraries(llama_chat PRIVATE godot::cpp llama-common llama)

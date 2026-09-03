@@ -113,6 +113,10 @@ class LlamaChat : public RefCounted {
     // Identifiers for calls the template leaves unnamed, unique for the life of the object.
     int64_t call_serial = 0;
 
+    // The device this model was put on, as ggml names it, or "cpu". Per object rather than
+    // per process: a second model may be loaded on another device beside this one.
+    std::string chosen_device;
+
     LlamaTimings timings;
 
 protected:
