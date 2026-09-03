@@ -8,6 +8,7 @@
 #include <godot_cpp/variant/string.hpp>
 
 #include "common.h"
+#include "ggml-backend.h"
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -110,9 +111,11 @@ class LlamaSpeech : public RefCounted {
     int sample_rate = 0;
 
     // Where the backbone was put, as ggml names it, and where the codec ended up. The two
-    // differ whenever the chosen backend cannot run the codec's graph.
+    // differ whenever the chosen backend cannot run the codec's graph. The handle beside them
+    // is what the crash line reads its free memory from; null means the processor.
     std::string chosen_device;
     std::string codec_device;
+    ggml_backend_dev_t device = nullptr;
 
     LlamaSpeechTimings timings;
 

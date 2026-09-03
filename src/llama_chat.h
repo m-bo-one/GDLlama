@@ -8,6 +8,7 @@
 
 #include "chat.h"
 #include "common.h"
+#include "ggml-backend.h"
 #include "llama.h"
 
 #include <atomic>
@@ -114,8 +115,10 @@ class LlamaChat : public RefCounted {
     int64_t call_serial = 0;
 
     // The device this model was put on, as ggml names it, or "cpu". Per object rather than
-    // per process: a second model may be loaded on another device beside this one.
+    // per process: a second model may be loaded on another device beside this one. The handle
+    // beside it is what the crash line reads its free memory from; null means the processor.
     std::string chosen_device;
+    ggml_backend_dev_t device = nullptr;
 
     LlamaTimings timings;
 

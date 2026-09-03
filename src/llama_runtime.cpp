@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -43,6 +44,56 @@ std::atomic<bool> already_reported{false};
 
 std::atomic<bool> handlers_installed{false};
 
+// The last lines llama.cpp and ggml wrote at error or warning level. ggml prints the cause of
+// a fault -- "CUDA error: out of memory", the device, the statement -- through its log and then
+// aborts with a message naming only a file and a line, so without this ring the crash line
+// carries the abort and not the reason. Fixed slots and no allocation: it is read while the
+// process is dying.
+//
+// A slot's last byte is only ever written as the terminator snprintf puts there, so a reader
+// racing a writer sees a mix of two messages and never runs off the end.
+constexpr int KEPT_LINES = 12;
+constexpr int KEPT_LENGTH = 256;
+char kept_lines[KEPT_LINES][KEPT_LENGTH];
+std::atomic<uint64_t> kept_written{0};
+
+// The device whichever class is working put its model on, with what its memory read when it
+// was noted. Sampled at a safe moment rather than from a handler, and stored as plain numbers.
+std::atomic<ggml_backend_dev_t> current_device{nullptr};
+std::atomic<uint64_t> device_free_mb{0};
+std::atomic<uint64_t> device_total_mb{0};
+char device_name[KEPT_LENGTH] = "";
+
+// One log line into the ring, its trailing newline and padding dropped so the crash report
+// reads as sentences rather than as a transcript. Whitespace alone is not a line.
+void keep_line(const char *text) {
+    if (text == nullptr) {
+        return;
+    }
+    size_t begin = 0;
+    while (text[begin] == ' ' || text[begin] == '\t' || text[begin] == '\n' || text[begin] == '\r') {
+        begin++;
+    }
+    size_t end = begin;
+    while (text[end] != '\0') {
+        end++;
+    }
+    while (end > begin && (text[end - 1] == ' ' || text[end - 1] == '\t' || text[end - 1] == '\n' ||
+                                  text[end - 1] == '\r')) {
+        end--;
+    }
+    if (end == begin) {
+        return;
+    }
+    const uint64_t slot = kept_written.fetch_add(1) % KEPT_LINES;
+    size_t length = end - begin;
+    if (length > (size_t)KEPT_LENGTH - 1) {
+        length = (size_t)KEPT_LENGTH - 1;
+    }
+    memcpy(kept_lines[slot], text + begin, length);
+    kept_lines[slot][length] = '\0';
+}
+
 // llama.cpp's lines below warning level are dropped unless asked for. A continuation line
 // follows the level of the line it continues, or a dropped message leaks its tail.
 void quiet_log(ggml_log_level level, const char *text, void *) {
@@ -51,6 +102,9 @@ void quiet_log(ggml_log_level level, const char *text, void *) {
         last_level.store((int)level);
     }
     const int shown = last_level.load();
+    if (shown == GGML_LOG_LEVEL_ERROR || shown == GGML_LOG_LEVEL_WARN) {
+        keep_line(text);
+    }
     if (shown == GGML_LOG_LEVEL_ERROR || shown == GGML_LOG_LEVEL_WARN || verbose_logs.load()) {
         fputs(text, stderr);
         fflush(stderr);
@@ -69,19 +123,57 @@ const char *last_operation() {
     return current_operation.load();
 }
 
+void note_device(ggml_backend_dev_t device) {
+    current_device.store(device);
+    if (device == nullptr) {
+        device_free_mb.store(0);
+        device_total_mb.store(0);
+        device_name[0] = '\0';
+        return;
+    }
+    size_t free = 0;
+    size_t total = 0;
+    ggml_backend_dev_memory(device, &free, &total);
+    device_free_mb.store((uint64_t)(free / (1024 * 1024)));
+    device_total_mb.store((uint64_t)(total / (1024 * 1024)));
+    snprintf(device_name, sizeof(device_name), "%s (%s)", ggml_backend_dev_name(device),
+            ggml_backend_dev_description(device));
+}
+
 // Composed into a fixed buffer rather than a std::string: this runs while the process is
-// dying, and a heap that has just been corrupted is the likeliest reason it is.
+// dying, and a heap that has just been corrupted is the likeliest reason it is. The kept log
+// lines go out with it, because the abort message names a file and a line and the reason is in
+// what the library wrote just before.
 void report_fatal(const char *reason, const char *detail) {
     if (already_reported.exchange(true)) {
         return;
     }
-    char line[1024];
-    snprintf(line, sizeof(line),
+    char line[4096];
+    int at = snprintf(line, sizeof(line),
             "LlamaChat extension: %s while %s.%s%s The process is going down; this line is the "
             "last thing it knows.",
             reason == nullptr ? "a fault" : reason, last_operation(),
             detail == nullptr || detail[0] == '\0' ? "" : " ",
             detail == nullptr ? "" : detail);
+    if (at < 0) {
+        at = 0;
+    }
+    // The card the working class chose and what was free on it when the operation began. Not
+    // asked for again here: the query goes through the backend that is dying.
+    if (device_name[0] != '\0' && at < (int)sizeof(line)) {
+        at += snprintf(line + at, sizeof(line) - (size_t)at,
+                "\nThe model was on %s, %llu MiB free of %llu MiB when this began.", device_name,
+                (unsigned long long)device_free_mb.load(), (unsigned long long)device_total_mb.load());
+    }
+    const uint64_t written = kept_written.load();
+    if (written > 0 && at > 0 && at < (int)sizeof(line)) {
+        at += snprintf(line + at, sizeof(line) - (size_t)at, "\nWhat the library said last:");
+        const uint64_t first = written > (uint64_t)KEPT_LINES ? written - (uint64_t)KEPT_LINES : 0;
+        for (uint64_t i = first; i < written && at > 0 && at < (int)sizeof(line); i++) {
+            at += snprintf(line + at, sizeof(line) - (size_t)at, "\n  %s",
+                    kept_lines[i % (uint64_t)KEPT_LINES]);
+        }
+    }
     // stderr first and flushed: the engine may already be unable to take a call, and this is
     // the copy that reaches a console either way.
     fputs(line, stderr);

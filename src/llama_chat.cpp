@@ -322,6 +322,7 @@ bool LlamaChat::load(const String &model_path, int n_ctx, int n_threads, int n_g
     params.cpuparams_batch.n_threads = threads;
 
     chosen_device = "cpu";
+    device = nullptr;
     // Zero layers on the GPU has to mean the GPU is not used at all: left to itself, ggml
     // still hands a large prompt batch to a GPU that is present, and a measurement or a
     // machine whose driver misbehaves gets a "CPU" run that was not one.
@@ -335,10 +336,14 @@ bool LlamaChat::load(const String &model_path, int n_ctx, int n_threads, int n_g
             // the whole file stays in the working set, because Windows cannot unmap a part.
             params.load_mode = LLAMA_LOAD_MODE_NONE;
             chosen_device = llama_runtime::describe_device(best);
+            device = best;
         } else {
             params.n_gpu_layers = 0;
         }
     }
+    // Noted before the weights are read, so a load that runs the card out of memory still says
+    // which card it was and how much of it was free before anything was put on it.
+    llama_runtime::note_device(device);
 
     std::lock_guard<std::mutex> hold(model_lock);
     try {
@@ -604,6 +609,7 @@ Array LlamaChat::describe_devices() {
 // on the main thread, where it would otherwise end the process.
 void LlamaChat::work(LlamaTurn turn, int64_t at) {
     llama_runtime::note_operation("LlamaChat was running a turn");
+    llama_runtime::note_device(device);
     try {
         run_turn(turn, at);
     } catch (const std::exception &e) {

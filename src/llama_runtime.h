@@ -43,6 +43,12 @@ bool is_verbose();
 // carries a line per encoded chunk.
 ggml_log_callback log_callback();
 
+// The device a class put its model on, sampled for its free and total memory as it is noted.
+// Called beside note_operation() at load and again as a turn begins, so the pair the crash
+// line prints belongs to whoever was working. Sampled here rather than read from a handler:
+// asking CUDA for its memory goes through the same check that is killing the process.
+void note_device(ggml_backend_dev_t device);
+
 // The best device for a whole model, or null when the machine has none: CUDA over any other
 // backend, then a discrete GPU over an integrated one, then the largest memory. CUDA is
 // preferred because it is the only backend that runs the speech codec's graph.

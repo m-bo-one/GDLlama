@@ -170,6 +170,7 @@ bool LlamaSpeech::load(const String &model_folder, int n_ctx, int n_threads, int
 
     chosen_device = "cpu";
     codec_device = "cpu";
+    device = nullptr;
     params.devices = { nullptr };
     ggml_backend_dev_t best = nullptr;
     if (params.n_gpu_layers != 0) {
@@ -184,6 +185,10 @@ bool LlamaSpeech::load(const String &model_folder, int n_ctx, int n_threads, int
             params.n_gpu_layers = 0;
         }
     }
+    // Noted before the weights are read, so a load that runs the card out of memory still says
+    // which card it was and how much of it was free before anything was put on it.
+    device = best;
+    llama_runtime::note_device(device);
 
     std::lock_guard<std::mutex> hold(model_lock);
     try {
@@ -491,6 +496,7 @@ bool LlamaSpeech::take_reference(const std::string &path, String &error) {
 // breadcrumb is what a fault too hard to catch leaves behind instead.
 void LlamaSpeech::work(LlamaSpeechTurn turn, int64_t at) {
     llama_runtime::note_operation("LlamaSpeech was making a sentence");
+    llama_runtime::note_device(device);
     try {
         run_turn(turn, at);
     } catch (const std::exception &e) {
