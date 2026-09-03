@@ -38,6 +38,11 @@ using clock_type = std::chrono::steady_clock;
 // rather than filling memory.
 constexpr int MAX_FRAMES = 720;
 
+// What a stopped sentence is reported as. A cancelled sentence still has to be delivered:
+// the flag saying the model is taken is lowered by a delivery, and a worker that returned in
+// silence would leave it raised and every sentence behind it queued for ever.
+constexpr const char *STOPPED_MESSAGE = "LlamaSpeech: the sentence was stopped before it was made.";
+
 // The one sequence the context holds, and the sampling the report measured the model with.
 constexpr llama_seq_id SEQUENCE = 0;
 constexpr int32_t DEFAULT_TOP_K = 50;
@@ -566,6 +571,7 @@ void LlamaSpeech::run_turn(const LlamaSpeechTurn &turn, int64_t at) {
 
     for (;;) {
         if (stop_asked.load()) {
+            post(failed_event(at, STOPPED_MESSAGE));
             return;
         }
         const int32_t left = gen.step_prompt(n_batch);
@@ -587,10 +593,24 @@ void LlamaSpeech::run_turn(const LlamaSpeechTurn &turn, int64_t at) {
     bool stop = false;
     while (!stop && frames < turn.max_frames) {
         if (stop_asked.load()) {
+            post(failed_event(at, STOPPED_MESSAGE));
             return;
         }
         const float *h_next = nullptr;
         if (gen.step_gen(sampled, h_state, &h_next, &stop) != 0) {
+            // A context with no cell left is the one failure here with a cause a caller can
+            // act on: the prompt and one row per frame have filled it, and the sentence has to
+            // be shorter. Anything else is the model breaking off for a reason of its own.
+            const int used = (int)llama_memory_seq_pos_max(llama_get_memory(ctx), SEQUENCE) + 1;
+            if (used >= context_tokens - 1) {
+                char sentence[256];
+                snprintf(sentence, sizeof(sentence),
+                        "LlamaSpeech: the sentence is too long to say in one piece. It filled the "
+                        "context of %d tokens after %d frames; split it and say the halves.",
+                        context_tokens, frames);
+                post(failed_event(at, String::utf8(sentence)));
+                return;
+            }
             post(failed_event(at, "LlamaSpeech: the sentence broke off while its sound was being made."));
             return;
         }
@@ -613,6 +633,7 @@ void LlamaSpeech::run_turn(const LlamaSpeechTurn &turn, int64_t at) {
         return;
     }
     if (stop_asked.load()) {
+        post(failed_event(at, STOPPED_MESSAGE));
         return;
     }
 
