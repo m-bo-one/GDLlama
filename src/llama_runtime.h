@@ -58,6 +58,28 @@ std::string describe_device(ggml_backend_dev_t device);
 // Every device the backends found, one dictionary each.
 godot::Array describe_devices();
 
+// What this library was last doing, as a literal that outlives the call: "LlamaSpeech: making
+// a sentence". Written before an operation that could take the process down and read by the
+// handlers below, which run when nothing else can be asked. A breadcrumb rather than a log
+// line, because one line per sentence in a game's console is not worth what it buys.
+//
+// It is the whole answer for a Windows fail-fast, which no handler ever sees: what survives
+// such a death is the last thing the process wrote down before it.
+void note_operation(const char *what);
+const char *last_operation();
+
+// One line naming this library, what it was doing and why it is dying, out through Godot's
+// error printing so it reaches the log file, and through stderr first so it lands even when
+// the engine can no longer be called. Safe from a handler: it allocates nothing.
+void report_fatal(const char *reason, const char *detail);
+
+// Installed once at library initialisation: a terminate handler, a Windows unhandled-exception
+// filter, a CRT invalid-parameter handler -- which is what turns one class of fail-fast back
+// into a report -- an abort signal handler, and ggml's own abort callback, so a GGML_ASSERT
+// names itself in the log before the process goes. Without these a fault inside a backend is a
+// process that disappears with nothing written anywhere.
+void install_crash_reporting();
+
 } // namespace llama_runtime
 
 #endif // LLAMA_RUNTIME_H

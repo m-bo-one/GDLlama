@@ -292,6 +292,7 @@ void LlamaChat::set_verbose(bool on) {
 // the turn's own rather than the backend's pipeline compilation.
 bool LlamaChat::load(const String &model_path, int n_ctx, int n_threads, int n_gpu_layers) {
     unload();
+    llama_runtime::note_operation("LlamaChat was loading a model");
     if (!ensure_backends()) {
         return false;
     }
@@ -367,12 +368,14 @@ bool LlamaChat::load(const String &model_path, int n_ctx, int n_threads, int n_g
         return false;
     }
     context_tokens = (int)llama_n_ctx(ctx);
+    llama_runtime::note_operation("LlamaChat was warming the model up");
     warm_up(params.n_gpu_layers != 0);
     cached.clear();
     kv_tokens.store(0);
     timings = LlamaTimings();
     timings.load_ms = ms_between(started, clock_type::now());
     loaded.store(true);
+    llama_runtime::note_operation("LlamaChat was waiting for a turn");
     return true;
 }
 
@@ -600,13 +603,17 @@ Array LlamaChat::describe_devices() {
 // The worker's whole life. An exception out of the turn is turned into a failure delivered
 // on the main thread, where it would otherwise end the process.
 void LlamaChat::work(LlamaTurn turn, int64_t at) {
+    llama_runtime::note_operation("LlamaChat was running a turn");
     try {
         run_turn(turn, at);
     } catch (const std::exception &e) {
-        post(failed_event(at, String("LlamaChat: ") + String::utf8(e.what())));
+        post(failed_event(at, String("LlamaChat: running the turn failed: ") + String::utf8(e.what())));
     } catch (...) {
-        post(failed_event(at, String("LlamaChat: the turn failed with an unknown error.")));
+        post(failed_event(at, String("LlamaChat: running the turn failed with an error that "
+                                     "carries no words. The editor log carries whatever the "
+                                     "library wrote before it.")));
     }
+    llama_runtime::note_operation("LlamaChat was waiting for a turn");
 }
 
 // One turn: render, tokenize, drop the context past the first token that differs from what

@@ -7,6 +7,10 @@
 #include "log.h"
 
 #include <atomic>
+#include <csignal>
+#include <cstdio>
+#include <cstring>
+#include <exception>
 #include <mutex>
 #include <set>
 
@@ -29,6 +33,16 @@ std::atomic<bool> backends_ready{false};
 std::mutex backends_lock;
 std::set<std::string> opened_folders;
 
+// The breadcrumb. A literal with static storage, so reading it from a handler on another
+// thread while a worker replaces it is a torn read of nothing: either pointer is valid text.
+std::atomic<const char *> current_operation{"nothing yet"};
+
+// Raised by the first handler to fire. Two of the paths below can run for one death -- ggml's
+// abort callback and then the abort signal -- and one line is the point of this.
+std::atomic<bool> already_reported{false};
+
+std::atomic<bool> handlers_installed{false};
+
 // llama.cpp's lines below warning level are dropped unless asked for. A continuation line
 // follows the level of the line it continues, or a dropped message leaks its tail.
 void quiet_log(ggml_log_level level, const char *text, void *) {
@@ -46,6 +60,93 @@ void quiet_log(ggml_log_level level, const char *text, void *) {
 } // namespace
 
 namespace llama_runtime {
+
+void note_operation(const char *what) {
+    current_operation.store(what == nullptr ? "nothing yet" : what);
+}
+
+const char *last_operation() {
+    return current_operation.load();
+}
+
+// Composed into a fixed buffer rather than a std::string: this runs while the process is
+// dying, and a heap that has just been corrupted is the likeliest reason it is.
+void report_fatal(const char *reason, const char *detail) {
+    if (already_reported.exchange(true)) {
+        return;
+    }
+    char line[1024];
+    snprintf(line, sizeof(line),
+            "LlamaChat extension: %s while %s.%s%s The process is going down; this line is the "
+            "last thing it knows.",
+            reason == nullptr ? "a fault" : reason, last_operation(),
+            detail == nullptr || detail[0] == '\0' ? "" : " ",
+            detail == nullptr ? "" : detail);
+    // stderr first and flushed: the engine may already be unable to take a call, and this is
+    // the copy that reaches a console either way.
+    fputs(line, stderr);
+    fputc('\n', stderr);
+    fflush(stderr);
+    UtilityFunctions::push_error(String::utf8(line));
+}
+
+// ggml calls this with its own message and then aborts, so a GGML_ASSERT inside a backend --
+// which is how the speech codec dies on Vulkan -- names its file, its line and its condition
+// in the Godot log rather than taking the process with nothing written.
+static void on_ggml_abort(const char *message) {
+    report_fatal("ggml stopped", message);
+}
+
+static void on_terminate() {
+    const char *detail = "";
+    if (std::current_exception() != nullptr) {
+        detail = "An exception left a thread with nobody to catch it.";
+    }
+    report_fatal("a thread ended in terminate", detail);
+    std::abort();
+}
+
+static void on_abort_signal(int) {
+    report_fatal("the process was aborted", "");
+    std::signal(SIGABRT, SIG_DFL);
+    std::raise(SIGABRT);
+}
+
+#ifdef _WIN32
+static LONG WINAPI on_unhandled_exception(EXCEPTION_POINTERS *info) {
+    char detail[128] = "";
+    if (info != nullptr && info->ExceptionRecord != nullptr) {
+        snprintf(detail, sizeof(detail), "Windows reports code 0x%08lX at 0x%p.",
+                (unsigned long)info->ExceptionRecord->ExceptionCode,
+                info->ExceptionRecord->ExceptionAddress);
+    }
+    report_fatal("the process faulted", detail);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// The C runtime calls this instead of failing fast when a parameter it was handed cannot be
+// used. Installing it is what turns that class of 0xC0000409 -- a death no filter above ever
+// sees -- back into a line somebody can read.
+static void on_invalid_parameter(const wchar_t *, const wchar_t *, const wchar_t *, unsigned int, uintptr_t) {
+    report_fatal("the runtime was handed a parameter it could not use", "");
+    std::abort();
+}
+#endif
+
+// Installed once, from the library's initialisation, and never taken down: a handler that is
+// removed while a worker is still running is a fault nobody reports.
+void install_crash_reporting() {
+    if (handlers_installed.exchange(true)) {
+        return;
+    }
+    std::set_terminate(on_terminate);
+    std::signal(SIGABRT, on_abort_signal);
+    ggml_set_abort_callback(on_ggml_abort);
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(on_unhandled_exception);
+    _set_invalid_parameter_handler(on_invalid_parameter);
+#endif
+}
 
 std::string to_std(const String &text) {
     const CharString bytes = text.utf8();

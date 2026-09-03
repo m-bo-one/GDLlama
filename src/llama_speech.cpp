@@ -134,6 +134,7 @@ static bool split_pair(const String &folder, String &backbone, String &mmproj, S
 // backbone onto the GPU only where its graph runs there, which today means CUDA alone.
 bool LlamaSpeech::load(const String &model_folder, int n_ctx, int n_threads, int n_gpu_layers) {
     unload();
+    llama_runtime::note_operation("LlamaSpeech was loading a speech model");
     if (!llama_runtime::ensure_backends()) {
         return false;
     }
@@ -224,6 +225,9 @@ bool LlamaSpeech::load(const String &model_folder, int n_ctx, int n_threads, int
     mtmd_params.n_threads = threads;
     mtmd_params.print_timings = false;
     mtmd_params.warmup = true;
+    // The codec's own load, warm-up included: the one step whose graph is known to abort on a
+    // backend that cannot run it, so the breadcrumb names it before it is entered.
+    llama_runtime::note_operation("LlamaSpeech was loading the speech codec");
     mctx.reset(mtmd_init_from_file(to_std(mmproj_path).c_str(), model, mtmd_params));
     if (!mctx) {
         UtilityFunctions::push_error("LlamaSpeech: the mmproj at \"" + mmproj_path + "\" could not be loaded.");
@@ -250,10 +254,12 @@ bool LlamaSpeech::load(const String &model_folder, int n_ctx, int n_threads, int
     codec_device = codec_on_gpu ? chosen_device : std::string("cpu");
 
     context_tokens = (int)llama_n_ctx(ctx);
+    llama_runtime::note_operation("LlamaSpeech was warming the model up");
     warm_up();
     timings = LlamaSpeechTimings();
     timings.load_ms = ms_between(started, clock_type::now());
     loaded.store(true);
+    llama_runtime::note_operation("LlamaSpeech was waiting for something to say");
     return true;
 }
 
@@ -481,15 +487,21 @@ bool LlamaSpeech::take_reference(const std::string &path, String &error) {
 }
 
 // The worker's whole life. An exception out of the sentence is turned into a failure delivered
-// on the main thread, where it would otherwise end the process.
+// on the main thread, where it would otherwise reach the engine and end the process. The
+// breadcrumb is what a fault too hard to catch leaves behind instead.
 void LlamaSpeech::work(LlamaSpeechTurn turn, int64_t at) {
+    llama_runtime::note_operation("LlamaSpeech was making a sentence");
     try {
         run_turn(turn, at);
     } catch (const std::exception &e) {
-        post(failed_event(at, String("LlamaSpeech: ") + String::utf8(e.what())));
+        post(failed_event(at,
+                String("LlamaSpeech: making the sentence failed: ") + String::utf8(e.what())));
     } catch (...) {
-        post(failed_event(at, String("LlamaSpeech: the sentence failed with an unknown error.")));
+        post(failed_event(at, String("LlamaSpeech: making the sentence failed with an error "
+                                     "that carries no words. The editor log carries whatever "
+                                     "the library wrote before it.")));
     }
+    llama_runtime::note_operation("LlamaSpeech was waiting for something to say");
 }
 
 // One sentence: the prompt through the backbone, then a frame at a time until the model says

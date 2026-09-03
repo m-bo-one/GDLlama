@@ -1,6 +1,7 @@
 #include "register_types.h"
 
 #include "llama_chat.h"
+#include "llama_runtime.h"
 #include "llama_speech.h"
 
 #include <gdextension_interface.h>
@@ -18,6 +19,9 @@ void initialize_llama_chat_module(ModuleInitializationLevel p_level) {
     if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
         return;
     }
+    // Before either class exists: a fault while a model is loading is as silent as one during
+    // a turn, and the handlers cost nothing until something goes wrong.
+    llama_runtime::install_crash_reporting();
     GDREGISTER_CLASS(LlamaChat);
     GDREGISTER_CLASS(LlamaSpeech);
 }
