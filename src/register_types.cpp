@@ -1,6 +1,7 @@
 #include "register_types.h"
 
 #include "llama_chat.h"
+#include "llama_speech.h"
 
 #include <gdextension_interface.h>
 #include <godot_cpp/core/class_db.hpp>
@@ -11,13 +12,14 @@
 
 namespace godot {
 
-// The class is registered and nothing else happens here: the ggml backends are opened by the
-// first load(), so a project that never loads a model never pays for a Vulkan instance.
+// The classes are registered and nothing else happens here: the ggml backends are opened by
+// the first load(), so a project that never loads a model never pays for a Vulkan instance.
 void initialize_llama_chat_module(ModuleInitializationLevel p_level) {
     if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
         return;
     }
     GDREGISTER_CLASS(LlamaChat);
+    GDREGISTER_CLASS(LlamaSpeech);
 }
 
 void uninitialize_llama_chat_module(ModuleInitializationLevel p_level) {

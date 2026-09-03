@@ -38,6 +38,10 @@ set(GGML_OPENMP OFF)
 set(GGML_VULKAN OFF)
 set(LLAMA_BUILD_COMMON ON)
 set(LLAMA_BUILD_TOOLS OFF)
+# The multimodal library alone, without the CLI binaries the tools tree would bring: it holds
+# the speech codec that turns the backbone's semantic codes into PCM. Its own CMakeLists gates
+# the executables on LLAMA_BUILD_TOOLS, which is why the pair above works.
+set(LLAMA_BUILD_MTMD ON)
 set(LLAMA_BUILD_EXAMPLES OFF)
 set(LLAMA_BUILD_TESTS OFF)
 set(LLAMA_BUILD_SERVER OFF)
@@ -65,9 +69,10 @@ endif()
 add_library(llama_chat SHARED
   src/llama_chat.cpp
   src/llama_runtime.cpp
+  src/llama_speech.cpp
   src/register_types.cpp
 )
-target_link_libraries(llama_chat PRIVATE godot::cpp llama-common llama)
+target_link_libraries(llama_chat PRIVATE godot::cpp llama-common llama mtmd)
 set_target_properties(llama_chat PROPERTIES
   PREFIX ""
   OUTPUT_NAME "libllama_chat.${LLAMA_CHAT_PLATFORM}.${GODOTCPP_TARGET}.${LLAMA_CHAT_ARCH}"
@@ -101,8 +106,10 @@ install(DIRECTORY "${CMAKE_BINARY_DIR}/bin/"
   FILES_MATCHING
     PATTERN "ggml*${CMAKE_SHARED_LIBRARY_SUFFIX}"
     PATTERN "llama*${CMAKE_SHARED_LIBRARY_SUFFIX}"
+    PATTERN "mtmd*${CMAKE_SHARED_LIBRARY_SUFFIX}"
     PATTERN "libggml*${CMAKE_SHARED_LIBRARY_SUFFIX}*"
     PATTERN "libllama*${CMAKE_SHARED_LIBRARY_SUFFIX}*"
+    PATTERN "libmtmd*${CMAKE_SHARED_LIBRARY_SUFFIX}*"
 )
 if (LLAMA_CHAT_VULKAN_DLL)
   install(FILES "${LLAMA_CHAT_VULKAN_DLL}" DESTINATION "${LLAMA_CHAT_INSTALL_DIR}/bin")
