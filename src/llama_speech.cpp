@@ -4,6 +4,8 @@
 
 #include <godot_cpp/classes/dir_access.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
+#include <godot_cpp/classes/rendering_device.hpp>
+#include <godot_cpp/classes/rendering_server.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/callable_method_pointer.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
@@ -70,6 +72,15 @@ struct BusyGuard {
 
     void hand_on() { held = nullptr; }
 };
+
+// Whether this process is drawing frames on a graphics device. The codec's soft-max asks the
+// CUDA driver for the whole of a block's opt-in shared memory, and the driver refuses that
+// while a renderer holds the same card -- ggml turns the refusal into an abort. Headless and
+// the dummy driver both answer null here, which is where the codec on CUDA was measured safe.
+bool is_rendering() {
+    RenderingServer *server = RenderingServer::get_singleton();
+    return server != nullptr && server->get_rendering_device() != nullptr;
+}
 
 LlamaSpeechEvent synthesised_event(int64_t at, PackedFloat32Array samples, int rate) {
     LlamaSpeechEvent event;
@@ -220,10 +231,13 @@ bool LlamaSpeech::load(const String &model_folder, int n_ctx, int n_threads, int
     // the game's console. Pointed at the same filter llama.cpp's lines go through.
     mtmd_helper_log_set(llama_runtime::log_callback(), nullptr);
 
-    // Only the CUDA backend runs the codec's graph: on Vulkan it dies inside GET_ROWS, so the
-    // mmproj stays on the CPU there and the device word says so. Changing this without
-    // measuring the assert again is how a game starts crashing on somebody else's card.
-    const bool codec_on_gpu = best != nullptr && llama_runtime::backend_name_of(best) == "CUDA";
+    // Two conditions, both measured, and the codec goes on the GPU only when both hold. Only
+    // the CUDA backend runs its graph at all: on Vulkan it dies inside GET_ROWS. And even on
+    // CUDA it dies on the first sentence while this process is rendering, because the driver
+    // will not grant a block's whole opt-in shared memory to a card that is drawing frames.
+    // Changing either without measuring again is how a game starts crashing on a real machine.
+    const bool codec_on_gpu =
+            best != nullptr && llama_runtime::backend_name_of(best) == "CUDA" && !is_rendering();
     mtmd_context_params mtmd_params = mtmd_context_params_default();
     mtmd_params.use_gpu = codec_on_gpu;
     mtmd_params.device = codec_on_gpu ? best : nullptr;
