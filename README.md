@@ -43,10 +43,16 @@ chat.generate(messages, tools, {"temperature": 0.7, "top_p": 0.8, "max_tokens": 
   `max_tokens`, `seed`, `enable_thinking`, `parallel_tool_calls`, `json_schema`. Refuses
   while a turn runs.
 - `cancel()` — never blocks; the running turn ends with `finished("cancelled", ...)`.
+- `deliver_pending()` — hands out every signal the worker has queued, on the calling
+  thread. The engine calls it deferred after each burst, so a game never needs to; a
+  caller that draws no frames — a headless test, a tool — calls it itself.
+- `wait_for_turn(timeout_ms) -> bool` — blocks, draining as it waits, until the turn in
+  flight has been handed out or the wait runs out. For frameless callers only.
 - `unload()`, `is_loaded()`, `is_busy()`, `context_size()`, `cached_tokens()`,
   `last_timings()`, `describe_devices()`, `LlamaChat.set_verbose(on)`.
-- Signals, all on the main thread: `piece_arrived(text)` — visible text only, whole UTF-8
-  letters; `tool_called(id, name, arguments_json)` — after the reply ended cleanly;
+- Signals, all on the main thread and in the order the worker produced them:
+  `piece_arrived(text)` — visible text only, whole UTF-8 letters;
+  `tool_called(id, name, arguments_json)` — after the reply ended cleanly;
   `finished(reason, prompt_tokens, completion_tokens)` with `stop`, `length`, `cancelled` or
   `tool_calls`; `failed(message)`.
 

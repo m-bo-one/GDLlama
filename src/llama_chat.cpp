@@ -292,6 +292,42 @@ bool ends_with(const std::string &text, const std::string &tail) {
     return tail.size() <= text.size() && text.compare(text.size() - tail.size(), tail.size(), tail) == 0;
 }
 
+LlamaEvent piece_event(int64_t at, const String &text) {
+    LlamaEvent event;
+    event.kind = LlamaEvent::PIECE;
+    event.at = at;
+    event.text = text;
+    return event;
+}
+
+LlamaEvent call_event(int64_t at, const String &id, const String &name, const String &arguments) {
+    LlamaEvent event;
+    event.kind = LlamaEvent::CALL;
+    event.at = at;
+    event.text = id;
+    event.name = name;
+    event.arguments = arguments;
+    return event;
+}
+
+LlamaEvent finished_event(int64_t at, const String &reason, int prompt_tokens, int completion_tokens) {
+    LlamaEvent event;
+    event.kind = LlamaEvent::FINISHED;
+    event.at = at;
+    event.name = reason;
+    event.prompt_tokens = prompt_tokens;
+    event.completion_tokens = completion_tokens;
+    return event;
+}
+
+LlamaEvent failed_event(int64_t at, const String &message) {
+    LlamaEvent event;
+    event.kind = LlamaEvent::FAILED;
+    event.at = at;
+    event.text = message;
+    return event;
+}
+
 const char *device_type_name(enum ggml_backend_dev_type type) {
     switch (type) {
         case GGML_BACKEND_DEVICE_TYPE_CPU:
@@ -500,6 +536,12 @@ void LlamaChat::unload() {
         cached.clear();
         kv_tokens.store(0);
     }
+    // What the joined worker left queued belongs to a model that is gone; the epoch would
+    // drop it on delivery, and clearing it here keeps a stale finish from ever being read.
+    {
+        std::lock_guard<std::mutex> hold(events_lock);
+        events.clear();
+    }
     if (owed.exchange(false)) {
         busy.store(false);
     }
@@ -582,6 +624,59 @@ void LlamaChat::cancel() {
     }
 }
 
+// Queues one thing to say and asks the engine for a drain unless one is already on its
+// way. The flag is what keeps a burst of a hundred pieces from queueing a hundred calls.
+void LlamaChat::post(LlamaEvent event) {
+    {
+        std::lock_guard<std::mutex> hold(events_lock);
+        events.push_back(std::move(event));
+    }
+    if (!drain_queued.exchange(true)) {
+        callable_mp(this, &LlamaChat::deliver_pending).call_deferred();
+    }
+}
+
+// The queue is swapped out under the lock and walked outside it, so a handler that starts
+// the next turn from inside a finish does not run against a lock the worker wants.
+void LlamaChat::deliver_pending() {
+    drain_queued.store(false);
+    std::vector<LlamaEvent> batch;
+    {
+        std::lock_guard<std::mutex> hold(events_lock);
+        batch.swap(events);
+    }
+    for (const LlamaEvent &event : batch) {
+        switch (event.kind) {
+            case LlamaEvent::PIECE:
+                deliver_piece(event.at, event.text);
+                break;
+            case LlamaEvent::CALL:
+                deliver_call(event.at, event.text, event.name, event.arguments);
+                break;
+            case LlamaEvent::FINISHED:
+                deliver_finished(event.at, event.name, event.prompt_tokens, event.completion_tokens);
+                break;
+            case LlamaEvent::FAILED:
+                deliver_failed(event.at, event.text);
+                break;
+        }
+    }
+}
+
+bool LlamaChat::wait_for_turn(int timeout_ms) {
+    const auto deadline = clock_type::now() + std::chrono::milliseconds(std::max(0, timeout_ms));
+    for (;;) {
+        deliver_pending();
+        if (!busy.load()) {
+            return true;
+        }
+        if (clock_type::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
 Dictionary LlamaChat::last_timings() const {
     Dictionary out;
     out["load_ms"] = timings.load_ms;
@@ -638,9 +733,9 @@ void LlamaChat::work(LlamaTurn turn, int64_t at) {
     try {
         run_turn(turn, at);
     } catch (const std::exception &e) {
-        callable_mp(this, &LlamaChat::deliver_failed).call_deferred(at, String("LlamaChat: ") + String::utf8(e.what()));
+        post(failed_event(at, String("LlamaChat: ") + String::utf8(e.what())));
     } catch (...) {
-        callable_mp(this, &LlamaChat::deliver_failed).call_deferred(at, String("LlamaChat: the turn failed with an unknown error."));
+        post(failed_event(at, String("LlamaChat: the turn failed with an unknown error.")));
     }
 }
 
@@ -650,7 +745,7 @@ void LlamaChat::work(LlamaTurn turn, int64_t at) {
 // its last letter is whole; calls go out once the reply has ended cleanly.
 void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
     auto fail = [&](const String &message) {
-        callable_mp(this, &LlamaChat::deliver_failed).call_deferred(at, message);
+        post(failed_event(at, message));
     };
 
     std::lock_guard<std::mutex> hold(model_lock);
@@ -713,7 +808,7 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
         if (stop_asked.load()) {
             cost.total_ms = ms_between(started, clock_type::now());
             timings = cost;
-            callable_mp(this, &LlamaChat::deliver_finished).call_deferred(at, String("cancelled"), (int)prompt.size(), 0);
+            post(finished_event(at, String("cancelled"), (int)prompt.size(), 0));
             return;
         }
         const size_t to = std::min(prompt.size(), from + (size_t)n_batch);
@@ -811,7 +906,7 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
                 first_piece = false;
                 cost.first_piece_ms = ms_between(started, clock_type::now());
             }
-            callable_mp(this, &LlamaChat::deliver_piece).call_deferred(at, String::utf8(visible.data() + sent, (int)(end - sent)));
+            post(piece_event(at, String::utf8(visible.data() + sent, (int)(end - sent))));
             sent = end;
         }
     };
@@ -864,8 +959,7 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
     flush();
     if (reason == "stop") {
         for (const common_chat_tool_call &call : parsed.tool_calls) {
-            callable_mp(this, &LlamaChat::deliver_call)
-                    .call_deferred(at, to_gd(call.id), to_gd(call.name), to_gd(call.arguments));
+            post(call_event(at, to_gd(call.id), to_gd(call.name), to_gd(call.arguments)));
         }
         if (!parsed.tool_calls.empty()) {
             reason = "tool_calls";
@@ -875,7 +969,7 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
     cost.completion_tokens = produced;
     cost.total_ms = ms_between(started, clock_type::now());
     timings = cost;
-    callable_mp(this, &LlamaChat::deliver_finished).call_deferred(at, to_gd(reason), (int)prompt.size(), produced);
+    post(finished_event(at, to_gd(reason), (int)prompt.size(), produced));
 }
 
 // The deliveries, on the main thread. A turn whose model was unloaded or replaced while it
@@ -925,6 +1019,8 @@ void LlamaChat::_bind_methods() {
     ClassDB::bind_method(D_METHOD("is_busy"), &LlamaChat::is_busy);
     ClassDB::bind_method(D_METHOD("generate", "messages", "tools", "options"), &LlamaChat::generate);
     ClassDB::bind_method(D_METHOD("cancel"), &LlamaChat::cancel);
+    ClassDB::bind_method(D_METHOD("deliver_pending"), &LlamaChat::deliver_pending);
+    ClassDB::bind_method(D_METHOD("wait_for_turn", "timeout_ms"), &LlamaChat::wait_for_turn);
     ClassDB::bind_method(D_METHOD("last_timings"), &LlamaChat::last_timings);
     ClassDB::bind_method(D_METHOD("context_size"), &LlamaChat::context_size);
     ClassDB::bind_method(D_METHOD("cached_tokens"), &LlamaChat::cached_tokens);

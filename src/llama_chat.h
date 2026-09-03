@@ -47,13 +47,29 @@ struct LlamaTimings {
     int completion_tokens = 0;
 };
 
+// One thing the worker has to say, kept on the object until the main thread hands it out.
+// A piece fills text; a call fills text with its id, then name and arguments; a finish
+// fills name with the reason and the two counts; a failure fills text with the sentence.
+struct LlamaEvent {
+    enum Kind { PIECE, CALL, FINISHED, FAILED };
+    Kind kind = PIECE;
+    int64_t at = 0;
+    String text;
+    String name;
+    String arguments;
+    int prompt_tokens = 0;
+    int completion_tokens = 0;
+};
+
 // A chat with one local model: the model's own chat template renders the history and the
 // tool declarations, the template's grammar constrains a call, and the template's parser
 // separates what the model says from what it calls. One llama_context lives as long as the
 // model is loaded, and a turn decodes only the tokens that differ from the ones already in it.
 //
-// generate() hands the turn to one worker thread and refuses while one runs; every signal
-// is delivered on the main thread. unload(), load() and the destructor wait for the worker.
+// generate() hands the turn to one worker thread and refuses while one runs. The worker
+// queues what it has to say on the object; a deferred call drains the queue on the main
+// thread after each burst, and deliver_pending() drains it for a caller that draws no
+// frames. unload(), load() and the destructor wait for the worker.
 class LlamaChat : public RefCounted {
     GDCLASS(LlamaChat, RefCounted)
 
@@ -63,6 +79,12 @@ class LlamaChat : public RefCounted {
     std::thread worker;
     std::atomic<bool> busy{false};
     std::atomic<bool> owed{false};
+
+    // What the worker has said and nobody has handed out yet, and whether a deferred drain
+    // is already on its way: one drain per burst of pieces rather than one call per piece.
+    std::mutex events_lock;
+    std::vector<LlamaEvent> events;
+    std::atomic<bool> drain_queued{false};
 
     // Read once per token by the worker; raised by cancel() and by unload().
     std::atomic<bool> stop_asked{false};
@@ -113,6 +135,15 @@ public:
     bool generate(const Array &messages, const Array &tools, const Dictionary &options);
     void cancel();
 
+    // Hands out every signal the worker has queued, on the calling thread, in order. The
+    // engine calls it deferred after each burst; a caller that draws no frames calls it.
+    void deliver_pending();
+
+    // Blocks the calling thread, draining as it waits, until the turn in flight has been
+    // handed out or the wait runs out; answers whether the turn is over. For a caller with
+    // no frames -- a headless test, a tool -- and never for a game, which has frames.
+    bool wait_for_turn(int timeout_ms);
+
     Dictionary last_timings() const;
     int context_size() const;
     int cached_tokens() const;
@@ -133,6 +164,7 @@ private:
     void warm_up(bool every_width);
     void work(LlamaTurn turn, int64_t at);
     void run_turn(const LlamaTurn &turn, int64_t at);
+    void post(LlamaEvent event);
     void deliver_piece(int64_t at, const String &text);
     void deliver_call(int64_t at, const String &id, const String &name, const String &arguments);
     void deliver_finished(int64_t at, const String &reason, int prompt_tokens, int completion_tokens);
