@@ -210,6 +210,10 @@ bool LlamaSpeech::load(const String &model_folder, int n_ctx, int n_threads, int
         return false;
     }
 
+    // mtmd keeps a logger of its own, and left alone it writes a line per encoded chunk into
+    // the game's console. Pointed at the same filter llama.cpp's lines go through.
+    mtmd_helper_log_set(llama_runtime::log_callback(), nullptr);
+
     // Only the CUDA backend runs the codec's graph: on Vulkan it dies inside GET_ROWS, so the
     // mmproj stays on the CPU there and the device word says so. Changing this without
     // measuring the assert again is how a game starts crashing on somebody else's card.

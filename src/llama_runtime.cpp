@@ -146,6 +146,10 @@ bool is_verbose() {
     return verbose_logs.load();
 }
 
+ggml_log_callback log_callback() {
+    return quiet_log;
+}
+
 std::string backend_name_of(ggml_backend_dev_t device) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
     const char *name = reg == nullptr ? nullptr : ggml_backend_reg_name(reg);

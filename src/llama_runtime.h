@@ -38,6 +38,11 @@ void shutdown_backends();
 void set_verbose(bool on);
 bool is_verbose();
 
+// The filter llama.cpp's log lines go through, so that a library with a logger of its own --
+// mtmd keeps a second one -- can be pointed at the same one. Without it a game's console
+// carries a line per encoded chunk.
+ggml_log_callback log_callback();
+
 // The best device for a whole model, or null when the machine has none: CUDA over any other
 // backend, then a discrete GPU over an integrated one, then the largest memory. CUDA is
 // preferred because it is the only backend that runs the speech codec's graph.
