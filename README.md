@@ -1,55 +1,95 @@
-# GDLlama
-> Isn't it cool to utilize large language model (LLM) to generate contents for your game?
-- @Adriankhl, original creator of GDLlama
+# LlamaChat
 
-Why, yes, I do think it is cool! 
+A Godot 4.5+ GDExtension that runs a chat with one local GGUF model through llama.cpp, in
+the process, on a worker thread. It exposes one class, `LlamaChat`, whose job is the part a
+chat client cannot do from GDScript: render the history and the tool declarations with the
+model's own chat template, constrain a call with the template's grammar, separate what the
+model says from what it calls while the tokens stream, and keep the context between turns so
+that a turn decodes only what changed.
 
-`GDLlama` is a GDExtension for Godot 4.4+ that acts as a bridge to the powerful `llama.cpp` library. This allows you to perform fast, local inference with Large Language Models (LLMs) directly in your game, without needing an internet connection or external servers.
+The lineage is the GDLlama / godot-llm extension; nothing of that node remains. The build
+skeleton is what was kept.
 
-It's implemented as a custom GDLlama node that you can add to any scene, making generative AI a native part of your project. It's designed to be flexible and powerful, supporting key features like:
-- Conversational AI: Maintain context between calls to create multi-turn chatbots.
-- Function Calling & Tool Use: Constrain the model's output to a specific JSON schema or GBNF grammar for reliable, structured output.
-- Real-time Streaming: Receive text as it's being generated using signals.
-- Flexible Generation: Perform both synchronous and asynchronous text generation.
-- Embeddings: Enable features like semantic search and content similarity checks.
+## What is pinned
 
-The generative space is an exciting frontier for video games that has been sorely under-explored so far. LLMs and multimodal models have a great potential to complement multiple aspects of game design, from dialogue generation to quest generation and beyond. Thanks to `llama.cpp`, we can perform inference fast enough locally to enable some genuinely interesting gameplay. I want to help Godot at least keep pace with Unity and Unreal.
+| Submodule | Where | Commit |
+|---|---|---|
+| `llama.cpp` | `llama.cpp/` | tag **b10786** (2026-09-03) |
+| `godot-cpp` | `godot-cpp/` | branch **4.5**, `27d9dd23c83871e0619fca5dc2cddfbfd69e926a` (2026-08-25) |
 
-I intend to maintain this for an indefinite amount of time while it continues to be useful to me. It has been almost entirely re-written with a number of new features. For a full release, I intend to publish this to the Godot Asset Shop. For progress, see: https://github.com/xarillian/GDLlama/milestone/1
+`compatibility_minimum` in the `.gdextension` is 4.5; a 4.5-built extension loads in 4.7.
 
-# Getting Started
-For now, everything has to be built by the user. GDLlama is not yet in the asset library, no sir.
+## The class
 
-## Build
-You'll need these tools:
-- CMake 3.14+
-- Ninja build system
-- Vulkan SDK (for GPU builds)
-- Git
-- (for Windows): Visual Studio Build Tools with clang-cl
-    - or some equivalent
+```gdscript
+var chat := LlamaChat.new()
+chat.load("res://models/Qwen3-4B-Q4_K_M.gguf", 8192, 8, -1)   # path, n_ctx, threads, gpu layers (-1: all)
 
-Then see the build steps: [docs/BUILD.md](docs/BUILD.md)
+chat.piece_arrived.connect(func(text: String) -> void: print(text))
+chat.tool_called.connect(func(id: String, name: String, arguments_json: String) -> void: ...)
+chat.finished.connect(func(reason: String, prompt_tokens: int, completion_tokens: int) -> void: ...)
+chat.failed.connect(func(message: String) -> void: push_error(message))
 
-## API
-There are three main access methods the moment:
-- `load_model` -> Used to load the model into memory.
-- `generate_text_async` -> Generates a single response from the loaded model. Clear context after a generation.
-- `generate_chat_async` -> Generates a single response from the loaded model and keeps track of context history. 
+chat.generate(messages, tools, {"temperature": 0.7, "top_p": 0.8, "max_tokens": 256,
+		"enable_thinking": false})
+```
 
-and three signals:
-- `generate_text_updated` -> Emitted during generation.
-- `generate_text_finished` -> Emitted when an async generation is finished.
-- `generate_text_error` -> Emitted when there is an error with text generation.
+- `load(model_path, n_ctx, n_threads, n_gpu_layers) -> bool` — an OS path or a `res://` /
+  `user://` one. `n_gpu_layers = -1` puts every layer on the largest GPU, `0` keeps the model
+  on the CPU. One `llama_context` lives as long as the model is loaded. The KV cache is f16.
+- `generate(messages, tools, options) -> bool` — messages in the OpenAI chat shape (`role`,
+  `content`; `tool_calls` on an assistant turn; `tool_call_id` on a `tool` turn), tools as
+  OpenAI function declarations, options `temperature`, `top_p`, `top_k`, `min_p`,
+  `max_tokens`, `seed`, `enable_thinking`, `parallel_tool_calls`, `json_schema`. Refuses
+  while a turn runs.
+- `cancel()` — never blocks; the running turn ends with `finished("cancelled", ...)`.
+- `unload()`, `is_loaded()`, `is_busy()`, `context_size()`, `cached_tokens()`,
+  `last_timings()`, `describe_devices()`, `LlamaChat.set_verbose(on)`.
+- Signals, all on the main thread: `piece_arrived(text)` — visible text only, whole UTF-8
+  letters; `tool_called(id, name, arguments_json)` — after the reply ended cleanly;
+  `finished(reason, prompt_tokens, completion_tokens)` with `stop`, `length`, `cancelled` or
+  `tool_calls`; `failed(message)`.
 
-That's a quick overview, but with those three methods and those three signals you can be well on your way to using this thing. The generation methods also accept grammar and JSON schema parameters for advanced use cases like function calling. If you want to dive deeper, GDLlama includes a full suite of docs for your convenience.
+`last_timings()` answers `load_ms`, `prompt_ms`, `first_piece_ms`, `generate_ms`,
+`total_ms`, `prompt_tokens`, `reused_tokens` (the prefix already in the context),
+`decoded_tokens` (what this turn actually decoded), `completion_tokens`,
+`tokens_per_second`, `prompt_tokens_per_second`, `device`, `context_size`.
 
-- [API Reference](docs/API_REFERENCE.md): A breakdown of every function, property, and signal.
-- [Architecture Guide](docs/ARCHITECTURE.md): Best practices for how to structure your code with `GDLlama`.
-- [Usage Examples](docs/EXAMPLES.md) or a [Basic Example](docs/API_REFERENCE.md#example-godot-usage): Getting started, common use-cases.
-- [LLM Legal](docs/AI_LEGAL.md): A curated list of legal resources for generative content in games.
+## Building on Windows (MSVC + Ninja)
 
-# Contributions
-PRs are welcome! This is my first big open source contribution and I am more than happy to share with the community. Check out [Contributing.md](docs/CONTRIBUTING.md) for more information.
+Prerequisites: Visual Studio 2022 Build Tools with the C++ workload, CMake 3.22+, Ninja
+(the copy inside the Build Tools works: pass it as `-DCMAKE_MAKE_PROGRAM=...`), Python 3
+for godot-cpp's binding generator. No Vulkan SDK.
 
-This is a fork of [Adriankhl's original godot-llm](https://github.com/Adriankhl/godot-llm) with updated build instructions and fixes for recent `llama.cpp` versions. I've since detached the fork as the work has compounded beyond his original vision. Huge thanks to them for creating this project! I could not have made it this far without their contributions.
+From a `vcvars64` prompt in the repository root, submodules initialised:
+
+```console
+cmake --preset windows-msvc-debug -DLLAMA_CHAT_VULKAN_DLL=<path to ggml-vulkan.dll>
+cmake --build --preset windows-msvc-debug
+cmake --install build/windows-msvc-debug
+```
+
+and the same with `windows-msvc-release` for the release library. Both are optimised
+builds; the preset picks godot-cpp's `template_debug` or `template_release` API, which is
+what the editor and an exported game respectively load.
+
+`cmake --install` writes `install/addons/llm/`: the `.gdextension`, and in `bin/` the
+extension library, `llama.dll`, `llama-common.dll`, `ggml.dll`, `ggml-base.dll`, the
+`ggml-cpu-*.dll` variants ggml picks from at run time, and — when
+`LLAMA_CHAT_VULKAN_DLL` was given — `ggml-vulkan.dll`.
+
+### Why the Vulkan backend is prebuilt
+
+ggml's Vulkan backend compiles its shaders at build time with `glslc` from the Vulkan SDK.
+Instead of requiring the SDK, this build enables ggml's dynamically loaded backends
+(`GGML_BACKEND_DL`) so every backend is a separate library found in the extension's folder
+at run time, and takes `ggml-vulkan.dll` from llama.cpp's own release archive of the **same
+tag** (`llama-b10786-bin-win-vulkan-x64.zip`). That library imports only `ggml-base.dll` and
+the C runtime, both of which this build provides at the same tag; the extension itself and
+the core libraries import nothing from Vulkan, so a machine without a Vulkan driver falls
+back to the CPU variants. When the tag moves, the archive moves with it.
+
+## Licence
+
+MIT, see `LICENSE`. llama.cpp and ggml are MIT (The ggml authors); godot-cpp is MIT (Godot
+Engine contributors). A shipped build carries their notices.
