@@ -15,6 +15,14 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 if (MSVC)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
   add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/utf-8>" "$<$<COMPILE_LANGUAGE:CXX>:/EHsc>")
+  # llama.cpp puts __FILE__ into every GGML_ASSERT and GGML_ABORT, and MSVC spells __FILE__ as
+  # the absolute path -- around 150 per library, so the built libraries would carry whichever
+  # folder they were compiled in. This trims that prefix off, leaving llama.cpp/src/llama.cpp.
+  # Undocumented but long-standing; an unrecognised /d1 flag is fatal error C1007, never a
+  # silent no-op, so a toolchain that drops it fails the build rather than baking paths again.
+  # A trailing forward slash on purpose: the trim matches either separator (measured), and a
+  # backslash before the closing quote would escape it out of the command line.
+  add_compile_options("/d1trimfile:${CMAKE_SOURCE_DIR}/")
 endif()
 
 # ---------------------------------------------------------------------------------------------
