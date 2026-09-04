@@ -476,17 +476,6 @@ void LlamaSpeech::set_verbose(bool on) {
     llama_runtime::set_verbose(on);
 }
 
-bool LlamaSpeech::load_backend_folder(const String &folder) {
-    String path = folder;
-    if (path.begins_with("res://") || path.begins_with("user://")) {
-        path = ProjectSettings::get_singleton()->globalize_path(path);
-    }
-    if (path.is_empty() || !DirAccess::dir_exists_absolute(path)) {
-        return false;
-    }
-    return llama_runtime::load_backend_folder(to_std(path));
-}
-
 // The reference clip decoded, resampled and kept as the bitmap the speaker encoder reads. One
 // path is read once however many sentences it speaks: the decode is milliseconds, but a clip
 // re-read per sentence is a file opened in the middle of a conversation.
@@ -696,8 +685,6 @@ void LlamaSpeech::_bind_methods() {
     ClassDB::bind_method(D_METHOD("context_size"), &LlamaSpeech::context_size);
     ClassDB::bind_method(D_METHOD("describe_devices"), &LlamaSpeech::describe_devices);
     ClassDB::bind_static_method("LlamaSpeech", D_METHOD("set_verbose", "on"), &LlamaSpeech::set_verbose);
-    ClassDB::bind_static_method(
-            "LlamaSpeech", D_METHOD("load_backend_folder", "folder"), &LlamaSpeech::load_backend_folder);
 
     ADD_SIGNAL(MethodInfo("synthesised", PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "samples"),
             PropertyInfo(Variant::INT, "rate")));

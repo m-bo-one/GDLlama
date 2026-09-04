@@ -13,7 +13,7 @@
 #include <cstring>
 #include <exception>
 #include <mutex>
-#include <set>
+
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -32,7 +32,6 @@ namespace {
 std::atomic<bool> verbose_logs{false};
 std::atomic<bool> backends_ready{false};
 std::mutex backends_lock;
-std::set<std::string> opened_folders;
 
 // The breadcrumb. A literal with static storage, so reading it from a handler on another
 // thread while a worker replaces it is a torn read of nothing: either pointer is valid text.
@@ -285,31 +284,10 @@ bool ensure_backends() {
     common_log_set_verbosity_thold(verbose_logs.load() ? LOG_LEVEL_INFO : LOG_LEVEL_WARN);
     llama_backend_init();
     const std::string folder = own_directory();
-    ggml_backend_load_all_from_path(folder.c_str());
-    opened_folders.insert(folder);
-    if (ggml_backend_dev_count() == 0) {
-        UtilityFunctions::push_error(
-                "LlamaRuntime: no ggml backend library was found beside the extension in \"" + to_gd(folder) + "\".");
-        return false;
-    }
-    backends_ready.store(true);
-    return true;
-}
-
-bool load_backend_folder(const std::string &folder) {
-    if (folder.empty()) {
-        return false;
-    }
-    if (!ensure_backends()) {
-        return false;
-    }
-    std::lock_guard<std::mutex> hold(backends_lock);
-    if (opened_folders.count(folder) != 0) {
-        return false;
-    }
-    opened_folders.insert(folder);
-    const size_t before = ggml_backend_dev_count();
 #ifdef _WIN32
+    // This folder goes on the library search path for the length of the call: a backend here
+    // imports its runtime from beside itself -- the CUDA one names three NVIDIA libraries --
+    // and Windows does not look in a loaded library's own directory for what it imports.
     const int wide_size = MultiByteToWideChar(CP_UTF8, 0, folder.c_str(), (int)folder.size(), nullptr, 0);
     std::wstring wide((size_t)wide_size, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, folder.c_str(), (int)folder.size(), &wide[0], wide_size);
@@ -319,13 +297,18 @@ bool load_backend_folder(const std::string &folder) {
 #else
     ggml_backend_load_all_from_path(folder.c_str());
 #endif
-    return ggml_backend_dev_count() > before;
+    if (ggml_backend_dev_count() == 0) {
+        UtilityFunctions::push_error(
+                "LlamaRuntime: no ggml backend library was found beside the extension in \"" + to_gd(folder) + "\".");
+        return false;
+    }
+    backends_ready.store(true);
+    return true;
 }
 
 void shutdown_backends() {
     std::lock_guard<std::mutex> hold(backends_lock);
     if (backends_ready.exchange(false)) {
-        opened_folders.clear();
         llama_backend_free();
     }
 }

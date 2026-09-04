@@ -20,16 +20,12 @@ godot::String to_gd(const std::string &text);
 // of the OS rather than of the engine, so an exported game and the editor answer the same.
 std::string own_directory();
 
-// Opens the backends beside this library, once for the process. False when the folder holds
-// none, which is the one failure a caller cannot go on from.
+// Opens every backend beside this library, once for the process: the ones that ship with the
+// addon and any that were dropped in later, the CUDA one included. That folder is put on the
+// DLL search path for the length of the call, because a backend there imports its runtime from
+// beside itself and Windows does not look in a loaded library's own folder. False when the
+// folder holds no backend at all, which is the one failure a caller cannot go on from.
 bool ensure_backends();
-
-// Opens the backends in one more folder, once per folder, for a backend too large to ship in
-// the addon -- the CUDA one, fetched beside the models. The folder is put on the DLL search
-// path for the length of the call, because a backend there imports its runtime from beside
-// itself and Windows does not look in a loaded library's own folder. Answers whether anything
-// was opened; a folder that is not there is not a failure.
-bool load_backend_folder(const std::string &folder);
 
 // Frees what the backends hold. Called when the library is unloaded.
 void shutdown_backends();

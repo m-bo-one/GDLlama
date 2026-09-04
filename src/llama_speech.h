@@ -158,11 +158,6 @@ public:
     // Whether llama.cpp's own log lines below warning level reach the console.
     static void set_verbose(bool on);
 
-    // Opens the ggml backends in one more folder, for a backend too large to travel in the
-    // addon. Called before any load; a folder that is not there answers false and is not a
-    // failure. Every class in this library sees what it registered.
-    static bool load_backend_folder(const String &folder);
-
 private:
     void warm_up();
     void work(LlamaSpeechTurn turn, int64_t at);
