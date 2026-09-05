@@ -280,6 +280,9 @@ bool LlamaSpeech::load(const String &model_folder, int n_ctx, int n_threads, int
     context_tokens = (int)llama_n_ctx(ctx);
     llama_runtime::note_operation("LlamaSpeech was warming the model up");
     warm_up();
+    // After the warm-up and not before: the compute buffers are sized by the widest batch the
+    // model is decoded at, and that is the batch the warm-up above has just put through it.
+    remember_what_it_holds();
     timings = LlamaSpeechTimings();
     timings.load_ms = ms_between(started, clock_type::now());
     loaded.store(true);
@@ -331,6 +334,10 @@ void LlamaSpeech::unload() {
         ctx = nullptr;
         vocab = nullptr;
         sampler = nullptr;
+        weights_bytes.store(0);
+        kv_bytes.store(0);
+        compute_bytes.store(0);
+        host_bytes.store(0);
     }
     {
         std::lock_guard<std::mutex> hold(events_lock);
@@ -470,6 +477,37 @@ int LlamaSpeech::context_size() const {
 
 Array LlamaSpeech::describe_devices() {
     return llama_runtime::describe_devices();
+}
+
+// Read off the context once, inside the load's own lock, and kept in the four atomics. Doing it
+// here rather than on every call is what lets a caller ask while a sentence is being made.
+void LlamaSpeech::remember_what_it_holds() {
+    const Dictionary held = llama_runtime::memory_report_of(ctx);
+    weights_bytes.store((int64_t)held["weights_bytes"]);
+    kv_bytes.store((int64_t)held["kv_bytes"]);
+    compute_bytes.store((int64_t)held["compute_bytes"]);
+    host_bytes.store((int64_t)held["host_bytes"]);
+}
+
+Dictionary LlamaSpeech::memory_report() const {
+    Dictionary out;
+    out["weights_bytes"] = weights_bytes.load();
+    out["kv_bytes"] = kv_bytes.load();
+    out["compute_bytes"] = compute_bytes.load();
+    out["host_bytes"] = host_bytes.load();
+    return out;
+}
+
+// The device the backbone went on, or the one a model would go on where none is loaded: a host
+// drawing a memory line before the first load still has a card to name.
+Dictionary LlamaSpeech::device_memory() {
+    ggml_backend_dev_t asked = device;
+    // The backends are opened here rather than assumed: before the first load nothing else has
+    // opened them, and an unopened registry has no devices at all to answer about.
+    if (asked == nullptr && !loaded.load() && llama_runtime::ensure_backends()) {
+        asked = llama_runtime::best_device();
+    }
+    return llama_runtime::device_memory_of(asked);
 }
 
 void LlamaSpeech::set_verbose(bool on) {
@@ -683,6 +721,8 @@ void LlamaSpeech::_bind_methods() {
     ClassDB::bind_method(D_METHOD("last_timings"), &LlamaSpeech::last_timings);
     ClassDB::bind_method(D_METHOD("output_rate"), &LlamaSpeech::output_rate);
     ClassDB::bind_method(D_METHOD("context_size"), &LlamaSpeech::context_size);
+    ClassDB::bind_method(D_METHOD("memory_report"), &LlamaSpeech::memory_report);
+    ClassDB::bind_method(D_METHOD("device_memory"), &LlamaSpeech::device_memory);
     ClassDB::bind_method(D_METHOD("describe_devices"), &LlamaSpeech::describe_devices);
     ClassDB::bind_static_method("LlamaSpeech", D_METHOD("set_verbose", "on"), &LlamaSpeech::set_verbose);
 

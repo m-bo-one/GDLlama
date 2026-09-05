@@ -120,6 +120,14 @@ class LlamaChat : public RefCounted {
     std::string chosen_device;
     ggml_backend_dev_t device = nullptr;
 
+    // What the library allocated for this model, taken once at the end of the load and kept.
+    // Read outside the model lock on purpose: asking the context during a turn would hold the
+    // caller for the whole turn, and none of the four moves once the load has returned.
+    std::atomic<int64_t> weights_bytes{0};
+    std::atomic<int64_t> kv_bytes{0};
+    std::atomic<int64_t> compute_bytes{0};
+    std::atomic<int64_t> host_bytes{0};
+
     LlamaTimings timings;
 
 protected:
@@ -155,6 +163,17 @@ public:
     int context_size() const;
     int cached_tokens() const;
 
+    // What this model holds, as the library counted it when the load finished: weights_bytes,
+    // kv_bytes, compute_bytes, and host_bytes for the part of the three that is ordinary memory
+    // rather than the card's. Zeroes with nothing loaded. Answered without waiting for a turn.
+    Dictionary memory_report() const;
+
+    // The free and total memory of the device this model was put on, or of the best device on
+    // the machine before anything is loaded: free_bytes, total_bytes and name. Both numbers are
+    // -1 where the machine has no device or its backend will not say, and both are about the
+    // whole card rather than this process's share of it.
+    Dictionary device_memory();
+
     // The ggml devices the backends found, one dictionary each, after the backends are
     // loaded. Opening them here when they are not yet is what a caller uses to see the GPU.
     Array describe_devices();
@@ -168,6 +187,7 @@ public:
 private:
     static bool ensure_backends();
 
+    void remember_what_it_holds();
     void warm_up(bool every_width);
     void work(LlamaTurn turn, int64_t at);
     void run_turn(const LlamaTurn &turn, int64_t at);

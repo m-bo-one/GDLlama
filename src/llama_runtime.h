@@ -2,9 +2,11 @@
 #define LLAMA_RUNTIME_H
 
 #include <godot_cpp/variant/array.hpp>
+#include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/string.hpp>
 
 #include "ggml-backend.h"
+#include "llama.h"
 
 #include <string>
 
@@ -59,6 +61,20 @@ std::string describe_device(ggml_backend_dev_t device);
 
 // Every device the backends found, one dictionary each.
 godot::Array describe_devices();
+
+// What one loaded context holds, as the library's own accounting: weights_bytes, kv_bytes and
+// compute_bytes summed over every buffer type it allocated, and host_bytes for the part of that
+// which is ordinary memory rather than the device's -- so what is on the card is the three
+// summed less host_bytes. Every number is bytes, and a null context answers zeroes.
+//
+// The library allocates all four at load, so a caller reads this once and keeps it: asking
+// during a turn would have to hold the lock the turn holds for the whole of it.
+godot::Dictionary memory_report_of(const llama_context *ctx);
+
+// One device's free and total memory as its backend reports it, with the name beside them, or
+// -1 for both where there is no device or the backend will not say. It is the whole card and
+// not this process's share of it: another program's model is in the same number.
+godot::Dictionary device_memory_of(ggml_backend_dev_t device);
 
 // What this library was last doing, as a literal that outlives the call: "LlamaSpeech: making
 // a sentence". Written before an operation that could take the process down and read by the

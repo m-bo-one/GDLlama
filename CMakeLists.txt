@@ -81,6 +81,10 @@ add_library(llama_chat SHARED
   src/register_types.cpp
 )
 target_link_libraries(llama_chat PRIVATE godot::cpp llama-common llama mtmd)
+# llama.cpp keeps its staging header, llama-ext.h, under src/ rather than include/, and the
+# buffer accounting a memory report reads lives only there. The folder is added to this target
+# alone: nothing else here reaches past the published headers.
+target_include_directories(llama_chat PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/src")
 set_target_properties(llama_chat PROPERTIES
   PREFIX ""
   OUTPUT_NAME "libllama_chat.${LLAMA_CHAT_PLATFORM}.${GODOTCPP_TARGET}.${LLAMA_CHAT_ARCH}"

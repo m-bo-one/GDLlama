@@ -4,6 +4,9 @@
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include "llama.h"
+// The staging header of llama.cpp, which is where the buffer accounting lives. It is under the
+// library's src/ rather than its include/, so the build puts that folder on this target's path.
+#include "llama-ext.h"
 #include "log.h"
 
 #include <atomic>
@@ -404,6 +407,55 @@ Array describe_devices() {
         entry["memory_free_mb"] = (int64_t)(free / (1024 * 1024));
         out.push_back(entry);
     }
+    return out;
+}
+
+Dictionary memory_report_of(const llama_context *ctx) {
+    int64_t weights = 0;
+    int64_t kv = 0;
+    int64_t compute = 0;
+    int64_t host = 0;
+    if (ctx != nullptr) {
+        // One entry per buffer type the context allocated anything in: the device's own, and
+        // the pinned host buffer beside it where the backend keeps one.
+        for (const auto &entry : llama_get_memory_breakdown(ctx)) {
+            const llama_memory_breakdown_data &held = entry.second;
+            weights += (int64_t)held.model;
+            kv += (int64_t)held.context;
+            compute += (int64_t)held.compute;
+            // Asked of the buffer type rather than of its device: a backend's pinned host
+            // buffer belongs to the device and is ordinary memory, and counting it as the
+            // card's would put half a gigabyte on a card that never held it.
+            if (ggml_backend_buft_is_host(entry.first)) {
+                host += (int64_t)held.total();
+            }
+        }
+    }
+    Dictionary out;
+    out["weights_bytes"] = weights;
+    out["kv_bytes"] = kv;
+    out["compute_bytes"] = compute;
+    out["host_bytes"] = host;
+    return out;
+}
+
+Dictionary device_memory_of(ggml_backend_dev_t device) {
+    Dictionary out;
+    out["free_bytes"] = (int64_t)-1;
+    out["total_bytes"] = (int64_t)-1;
+    out["name"] = String();
+    if (device == nullptr) {
+        return out;
+    }
+    size_t free = 0;
+    size_t total = 0;
+    ggml_backend_dev_memory(device, &free, &total);
+    out["name"] = to_gd(describe_device(device));
+    if (total == 0) {
+        return out;
+    }
+    out["free_bytes"] = (int64_t)free;
+    out["total_bytes"] = (int64_t)total;
     return out;
 }
 

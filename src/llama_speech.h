@@ -117,6 +117,14 @@ class LlamaSpeech : public RefCounted {
     std::string codec_device;
     ggml_backend_dev_t device = nullptr;
 
+    // What the library allocated for the backbone, taken once at the end of the load and kept.
+    // The codec is a second runtime of its own and is not in these: a caller that wants it
+    // whole adds the projector file beside them. Read outside the lock, as the timings are.
+    std::atomic<int64_t> weights_bytes{0};
+    std::atomic<int64_t> kv_bytes{0};
+    std::atomic<int64_t> compute_bytes{0};
+    std::atomic<int64_t> host_bytes{0};
+
     LlamaSpeechTimings timings;
 
 protected:
@@ -152,6 +160,17 @@ public:
     int output_rate() const;
     int context_size() const;
 
+    // What the backbone holds, as the library counted it when the load finished: weights_bytes,
+    // kv_bytes, compute_bytes, and host_bytes for the part of the three that is ordinary memory
+    // rather than the card's. The codec's own buffers are not among them -- it is a runtime of
+    // its own, and llama.cpp accounts for nothing outside its context.
+    Dictionary memory_report() const;
+
+    // The free and total memory of the device this model was put on, or of the best device on
+    // the machine before anything is loaded: free_bytes, total_bytes and name, with -1 for both
+    // numbers where no backend will say. It is the whole card and not this process's share.
+    Dictionary device_memory();
+
     // The ggml devices the backends found, one dictionary each, after the backends are loaded.
     Array describe_devices();
 
@@ -159,6 +178,7 @@ public:
     static void set_verbose(bool on);
 
 private:
+    void remember_what_it_holds();
     void warm_up();
     void work(LlamaSpeechTurn turn, int64_t at);
     void run_turn(const LlamaSpeechTurn &turn, int64_t at);

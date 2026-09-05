@@ -375,6 +375,9 @@ bool LlamaChat::load(const String &model_path, int n_ctx, int n_threads, int n_g
     context_tokens = (int)llama_n_ctx(ctx);
     llama_runtime::note_operation("LlamaChat was warming the model up");
     warm_up(params.n_gpu_layers != 0);
+    // After the warm-up and not before: the compute buffers are sized by the widest batch the
+    // model is decoded at, and that is the batch the warm-up above has just put through it.
+    remember_what_it_holds();
     cached.clear();
     kv_tokens.store(0);
     timings = LlamaTimings();
@@ -430,6 +433,10 @@ void LlamaChat::unload() {
         vocab = nullptr;
         cached.clear();
         kv_tokens.store(0);
+        weights_bytes.store(0);
+        kv_bytes.store(0);
+        compute_bytes.store(0);
+        host_bytes.store(0);
     }
     // What the joined worker left queued belongs to a model that is gone; the epoch would
     // drop it on delivery, and clearing it here keeps a stale finish from ever being read.
@@ -603,6 +610,37 @@ int LlamaChat::cached_tokens() const {
 
 Array LlamaChat::describe_devices() {
     return llama_runtime::describe_devices();
+}
+
+// Read off the context once, inside the load's own lock, and kept in the four atomics. Doing it
+// here rather than on every call is what lets a caller ask while a turn is running.
+void LlamaChat::remember_what_it_holds() {
+    const Dictionary held = llama_runtime::memory_report_of(ctx);
+    weights_bytes.store((int64_t)held["weights_bytes"]);
+    kv_bytes.store((int64_t)held["kv_bytes"]);
+    compute_bytes.store((int64_t)held["compute_bytes"]);
+    host_bytes.store((int64_t)held["host_bytes"]);
+}
+
+Dictionary LlamaChat::memory_report() const {
+    Dictionary out;
+    out["weights_bytes"] = weights_bytes.load();
+    out["kv_bytes"] = kv_bytes.load();
+    out["compute_bytes"] = compute_bytes.load();
+    out["host_bytes"] = host_bytes.load();
+    return out;
+}
+
+// The device this model went on, or the one a model would go on where none is loaded: a host
+// drawing a memory line before the first load still has a card to name.
+Dictionary LlamaChat::device_memory() {
+    ggml_backend_dev_t asked = device;
+    // The backends are opened here rather than assumed: before the first load nothing else has
+    // opened them, and an unopened registry has no devices at all to answer about.
+    if (asked == nullptr && !loaded.load() && llama_runtime::ensure_backends()) {
+        asked = llama_runtime::best_device();
+    }
+    return llama_runtime::device_memory_of(asked);
 }
 
 // The worker's whole life. An exception out of the turn is turned into a failure delivered
@@ -907,6 +945,8 @@ void LlamaChat::_bind_methods() {
     ClassDB::bind_method(D_METHOD("last_timings"), &LlamaChat::last_timings);
     ClassDB::bind_method(D_METHOD("context_size"), &LlamaChat::context_size);
     ClassDB::bind_method(D_METHOD("cached_tokens"), &LlamaChat::cached_tokens);
+    ClassDB::bind_method(D_METHOD("memory_report"), &LlamaChat::memory_report);
+    ClassDB::bind_method(D_METHOD("device_memory"), &LlamaChat::device_memory);
     ClassDB::bind_method(D_METHOD("describe_devices"), &LlamaChat::describe_devices);
     ClassDB::bind_static_method("LlamaChat", D_METHOD("set_verbose", "on"), &LlamaChat::set_verbose);
 
