@@ -776,10 +776,11 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
     }
     sampling.preserved_tokens = preserved;
 
-    // The thought's ceiling, armed from the template's own thinking markers the way the server
-    // arms it: once the budget is spent the first end marker is forced, the thought closes and
-    // the turn goes on into the visible answer. A template with no markers arms nothing.
-    const std::string thinking_start = chat.thinking_start_tag;
+    // The thought's ceiling and the count below, armed from the template's own thinking markers
+    // the way the server arms it: the budget spent, the first end marker is forced and the turn
+    // goes on into the visible answer. A template with no markers arms nothing, and neither does
+    // a turn with thinking off, whatever empty thought the template makes the model write.
+    const std::string thinking_start = turn.inputs.enable_thinking ? chat.thinking_start_tag : std::string();
     std::vector<std::string> thinking_end;
     for (const std::string &tag : chat.thinking_end_tags) {
         if (!tag.empty()) {
