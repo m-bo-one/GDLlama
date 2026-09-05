@@ -30,6 +30,9 @@ struct LlamaTurn {
     int top_k = 20;
     float min_p = 0.0f;
     int max_tokens = 512;
+    // How many tokens the thought may spend before its end marker is forced; 0 or less leaves
+    // it unbounded. Without it a long thought reaches max_tokens and the turn says nothing.
+    int thinking_budget = 0;
     uint32_t seed = LLAMA_DEFAULT_SEED;
 };
 
@@ -46,6 +49,9 @@ struct LlamaTimings {
     int reused_tokens = 0;
     int decoded_tokens = 0;
     int completion_tokens = 0;
+    // The part of completion_tokens the thought took, counted between the template's thinking
+    // markers. Zero for a template that has none and for a turn that never opened a thought.
+    int reasoning_tokens = 0;
 };
 
 // One thing the worker has to say, kept on the object until the main thread hands it out.
@@ -144,9 +150,9 @@ public:
     bool is_busy() const;
 
     // Messages in the OpenAI chat shape, tools as OpenAI function declarations, and the
-    // options temperature, top_p, top_k, min_p, max_tokens, seed, enable_thinking,
-    // parallel_tool_calls, json_schema. False when the model is not loaded, a turn is
-    // running, or the messages do not read.
+    // options temperature, top_p, top_k, min_p, max_tokens, thinking_budget, seed,
+    // enable_thinking, parallel_tool_calls, json_schema. False when the model is not loaded,
+    // a turn is running, or the messages do not read.
     bool generate(const Array &messages, const Array &tools, const Dictionary &options);
     void cancel();
 

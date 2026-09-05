@@ -496,6 +496,7 @@ bool LlamaChat::generate(const Array &messages, const Array &tools, const Dictio
     if (turn.max_tokens <= 0) {
         turn.max_tokens = context_tokens;
     }
+    turn.thinking_budget = (int)options.get("thinking_budget", 0);
     if (options.has("seed")) {
         turn.seed = (uint32_t)(int64_t)options["seed"];
     }
@@ -591,6 +592,7 @@ Dictionary LlamaChat::last_timings() const {
     out["reused_tokens"] = timings.reused_tokens;
     out["decoded_tokens"] = timings.decoded_tokens;
     out["completion_tokens"] = timings.completion_tokens;
+    out["reasoning_tokens"] = timings.reasoning_tokens;
     const double prompt_seconds = timings.prompt_ms / 1000.0;
     const double generate_seconds = timings.generate_ms / 1000.0;
     out["prompt_tokens_per_second"] = prompt_seconds > 0.0 ? timings.decoded_tokens / prompt_seconds : 0.0;
@@ -773,6 +775,26 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
         }
     }
     sampling.preserved_tokens = preserved;
+
+    // The thought's ceiling, armed from the template's own thinking markers the way the server
+    // arms it: once the budget is spent the first end marker is forced, the thought closes and
+    // the turn goes on into the visible answer. A template with no markers arms nothing.
+    const std::string thinking_start = chat.thinking_start_tag;
+    std::vector<std::string> thinking_end;
+    for (const std::string &tag : chat.thinking_end_tags) {
+        if (!tag.empty()) {
+            thinking_end.push_back(tag);
+        }
+    }
+    if (turn.thinking_budget > 0 && !thinking_start.empty() && !thinking_end.empty()) {
+        sampling.reasoning_budget_tokens = turn.thinking_budget;
+        sampling.reasoning_budget_start = common_tokenize(vocab, thinking_start, false, true);
+        for (const std::string &tag : thinking_end) {
+            sampling.reasoning_budget_end.push_back(common_tokenize(vocab, tag, false, true));
+        }
+        sampling.reasoning_budget_forced = sampling.reasoning_budget_end.front();
+    }
+
     common_sampler_ptr sampler(common_sampler_init(model, sampling));
     if (!sampler) {
         fail("LlamaChat: the sampler could not be built from the template's grammar.");
@@ -832,6 +854,15 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
         }
     };
 
+    // The thought is counted from the token after the start marker to the one that completes an
+    // end marker, forced or reached on its own. Counted whether or not a budget was given, so a
+    // caller can see what an unbounded thought cost before deciding on a ceiling.
+    int reasoning_tokens = 0;
+    // A template whose generation prompt already opens the thought leaves nothing to see in the
+    // output; the sampler is armed from that prompt too, so the count starts open with it.
+    bool inside_thought = !thinking_start.empty() && ends_with(chat.generation_prompt, thinking_start);
+    bool thought_over = false;
+
     std::string reason = "stop";
     int produced = 0;
     const auto generate_started = clock_type::now();
@@ -851,6 +882,19 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
         }
         produced++;
         generated += common_token_to_piece(vocab, token, preserved.count(token) > 0);
+        if (!thought_over && !thinking_start.empty()) {
+            if (inside_thought) {
+                reasoning_tokens++;
+                for (const std::string &tag : thinking_end) {
+                    if (ends_with(generated, tag)) {
+                        thought_over = true;
+                        break;
+                    }
+                }
+            } else if (ends_with(generated, thinking_start)) {
+                inside_thought = true;
+            }
+        }
         reread(true);
         flush();
 
@@ -888,6 +932,7 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
     }
 
     cost.completion_tokens = produced;
+    cost.reasoning_tokens = reasoning_tokens;
     cost.total_ms = ms_between(started, clock_type::now());
     timings = cost;
     post(finished_event(at, to_gd(reason), (int)prompt.size(), produced));

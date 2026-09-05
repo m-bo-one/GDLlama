@@ -40,8 +40,8 @@ chat.generate(messages, tools, {"temperature": 0.7, "top_p": 0.8, "max_tokens": 
 - `generate(messages, tools, options) -> bool` — messages in the OpenAI chat shape (`role`,
   `content`; `tool_calls` on an assistant turn; `tool_call_id` on a `tool` turn), tools as
   OpenAI function declarations, options `temperature`, `top_p`, `top_k`, `min_p`,
-  `max_tokens`, `seed`, `enable_thinking`, `parallel_tool_calls`, `json_schema`. Refuses
-  while a turn runs.
+  `max_tokens`, `thinking_budget`, `seed`, `enable_thinking`, `parallel_tool_calls`,
+  `json_schema`. Refuses while a turn runs.
 - `cancel()` — never blocks; the running turn ends with `finished("cancelled", ...)`.
 - `deliver_pending()` — hands out every signal the worker has queued, on the calling
   thread. The engine calls it deferred after each burst, so a game never needs to; a
@@ -56,9 +56,19 @@ chat.generate(messages, tools, {"temperature": 0.7, "top_p": 0.8, "max_tokens": 
   `finished(reason, prompt_tokens, completion_tokens)` with `stop`, `length`, `cancelled` or
   `tool_calls`; `failed(message)`.
 
+`thinking_budget` is the ceiling on the thought alone, in tokens, for that one turn; absent or
+zero or less leaves the thought unbounded, which is what it has always been. The tags come from
+the model's own chat template — its thinking markers, whatever they are for that family — so
+nothing has to be spelled out per model, and a template with no markers ignores the option. Once
+the budget is spent the first end marker is forced token by token, the thought closes, and
+generation carries on into the visible answer, which `max_tokens` still bounds as before. Without
+it a thought long enough to reach `max_tokens` ends the turn with nothing said at all.
+
 `last_timings()` answers `load_ms`, `prompt_ms`, `first_piece_ms`, `generate_ms`,
 `total_ms`, `prompt_tokens`, `reused_tokens` (the prefix already in the context),
-`decoded_tokens` (what this turn actually decoded), `completion_tokens`,
+`decoded_tokens` (what this turn actually decoded), `completion_tokens`, `reasoning_tokens`
+(the part of them the thought took, counted whether or not a budget was given, and readable
+from the `finished` handler because the turn's cost is written before the signal goes out),
 `tokens_per_second`, `prompt_tokens_per_second`, `device`, `context_size`.
 
 ## Building on Windows (MSVC + Ninja)
