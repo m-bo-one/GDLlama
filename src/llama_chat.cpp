@@ -230,6 +230,20 @@ bool ends_with(const std::string &text, const std::string &tail) {
     return tail.size() <= text.size() && text.compare(text.size() - tail.size(), tail.size(), tail) == 0;
 }
 
+// The tag at the end of the text with trailing blanks ignored. A template that opens the thought
+// in its generation prompt puts a newline after the tag, and a plain end-of-string match misses
+// it -- which leaves the thought uncounted and its ceiling unarmed.
+bool ends_with_tag(const std::string &text, const std::string &tag) {
+    if (tag.empty()) {
+        return false;
+    }
+    size_t end = text.size();
+    while (end > 0 && (unsigned char)text[end - 1] <= ' ') {
+        end--;
+    }
+    return tag.size() <= end && text.compare(end - tag.size(), tag.size(), tag) == 0;
+}
+
 LlamaEvent piece_event(int64_t at, const String &text) {
     LlamaEvent event;
     event.kind = LlamaEvent::PIECE;
@@ -787,9 +801,27 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
             thinking_end.push_back(tag);
         }
     }
+    // After a tool result the template opens the thought itself, tag and newline both inside the
+    // generation prompt. The budget is armed from the prompt's own trailing tokens rather than
+    // from the tag tokenized alone, so the seeding matches and counting starts with this turn.
+    const bool prompt_opens_thought = ends_with_tag(chat.generation_prompt, thinking_start);
+    llama_tokens opened_by;
+    if (prompt_opens_thought) {
+        const llama_tokens prompt_ids = common_tokenize(vocab, chat.generation_prompt, false, true);
+        const size_t reach = std::min<size_t>(prompt_ids.size(), 8);
+        std::string tail;
+        for (size_t take = 1; take <= reach; take++) {
+            tail = common_token_to_piece(vocab, prompt_ids[prompt_ids.size() - take], true) + tail;
+            if (ends_with_tag(tail, thinking_start)) {
+                opened_by.assign(prompt_ids.end() - take, prompt_ids.end());
+                break;
+            }
+        }
+    }
     if (turn.thinking_budget > 0 && !thinking_start.empty() && !thinking_end.empty()) {
         sampling.reasoning_budget_tokens = turn.thinking_budget;
-        sampling.reasoning_budget_start = common_tokenize(vocab, thinking_start, false, true);
+        sampling.reasoning_budget_start =
+                opened_by.empty() ? common_tokenize(vocab, thinking_start, false, true) : opened_by;
         for (const std::string &tag : thinking_end) {
             sampling.reasoning_budget_end.push_back(common_tokenize(vocab, tag, false, true));
         }
@@ -861,7 +893,7 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
     int reasoning_tokens = 0;
     // A template whose generation prompt already opens the thought leaves nothing to see in the
     // output; the sampler is armed from that prompt too, so the count starts open with it.
-    bool inside_thought = !thinking_start.empty() && ends_with(chat.generation_prompt, thinking_start);
+    bool inside_thought = prompt_opens_thought;
     bool thought_over = false;
 
     std::string reason = "stop";
