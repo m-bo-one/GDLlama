@@ -33,6 +33,17 @@ struct LlamaTurn {
     // How many tokens the thought may spend before its end marker is forced; 0 or less leaves
     // it unbounded. Without it a long thought reaches max_tokens and the turn says nothing.
     int thinking_budget = 0;
+    // What a repetition costs this turn, under llama.cpp's own names. The penalties sampler and
+    // DRY are already in the chain; at these defaults both pass everything through, so a caller
+    // that asks for nothing gets the sampling it had.
+    float penalty_repeat = 1.0f;
+    int penalty_last_n = 64;
+    float penalty_freq = 0.0f;
+    float penalty_present = 0.0f;
+    float dry_multiplier = 0.0f;
+    float dry_base = 1.75f;
+    int dry_allowed_length = 2;
+    int dry_penalty_last_n = 64;
     uint32_t seed = LLAMA_DEFAULT_SEED;
 };
 
@@ -151,8 +162,8 @@ public:
 
     // Messages in the OpenAI chat shape, tools as OpenAI function declarations, and the
     // options temperature, top_p, top_k, min_p, max_tokens, thinking_budget, seed,
-    // enable_thinking, parallel_tool_calls, json_schema. False when the model is not loaded,
-    // a turn is running, or the messages do not read.
+    // enable_thinking, parallel_tool_calls, json_schema and the penalties above. False when the
+    // model is not loaded, a turn is running, or the messages do not read.
     bool generate(const Array &messages, const Array &tools, const Dictionary &options);
     void cancel();
 

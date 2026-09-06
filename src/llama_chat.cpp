@@ -511,6 +511,16 @@ bool LlamaChat::generate(const Array &messages, const Array &tools, const Dictio
         turn.max_tokens = context_tokens;
     }
     turn.thinking_budget = (int)options.get("thinking_budget", 0);
+    // Every penalty defaults to llama.cpp's own number, so a key nobody passed changes nothing.
+    const common_params_sampling defaults;
+    turn.penalty_repeat = (float)(double)options.get("penalty_repeat", defaults.penalty_repeat);
+    turn.penalty_last_n = (int)options.get("penalty_last_n", defaults.penalty_last_n);
+    turn.penalty_freq = (float)(double)options.get("penalty_freq", defaults.penalty_freq);
+    turn.penalty_present = (float)(double)options.get("penalty_present", defaults.penalty_present);
+    turn.dry_multiplier = (float)(double)options.get("dry_multiplier", defaults.dry_multiplier);
+    turn.dry_base = (float)(double)options.get("dry_base", defaults.dry_base);
+    turn.dry_allowed_length = (int)options.get("dry_allowed_length", defaults.dry_allowed_length);
+    turn.dry_penalty_last_n = (int)options.get("dry_penalty_last_n", defaults.dry_penalty_last_n);
     if (options.has("seed")) {
         turn.seed = (uint32_t)(int64_t)options["seed"];
     }
@@ -773,6 +783,14 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
     sampling.top_p = turn.top_p;
     sampling.top_k = turn.top_k;
     sampling.min_p = turn.min_p;
+    sampling.penalty_repeat = turn.penalty_repeat;
+    sampling.penalty_last_n = turn.penalty_last_n;
+    sampling.penalty_freq = turn.penalty_freq;
+    sampling.penalty_present = turn.penalty_present;
+    sampling.dry_multiplier = turn.dry_multiplier;
+    sampling.dry_base = turn.dry_base;
+    sampling.dry_allowed_length = turn.dry_allowed_length;
+    sampling.dry_penalty_last_n = turn.dry_penalty_last_n;
     if (!chat.grammar.empty()) {
         const common_grammar_type kind =
                 turn.inputs.tools.empty() ? COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT : COMMON_GRAMMAR_TYPE_TOOL_CALLS;

@@ -41,7 +41,7 @@ chat.generate(messages, tools, {"temperature": 0.7, "top_p": 0.8, "max_tokens": 
   `content`; `tool_calls` on an assistant turn; `tool_call_id` on a `tool` turn), tools as
   OpenAI function declarations, options `temperature`, `top_p`, `top_k`, `min_p`,
   `max_tokens`, `thinking_budget`, `seed`, `enable_thinking`, `parallel_tool_calls`,
-  `json_schema`. Refuses while a turn runs.
+  `json_schema`, and the repetition penalties below. Refuses while a turn runs.
 - `cancel()` — never blocks; the running turn ends with `finished("cancelled", ...)`.
 - `deliver_pending()` — hands out every signal the worker has queued, on the calling
   thread. The engine calls it deferred after each burst, so a game never needs to; a
@@ -63,6 +63,15 @@ nothing has to be spelled out per model, and a template with no markers ignores 
 the budget is spent the first end marker is forced token by token, the thought closes, and
 generation carries on into the visible answer, which `max_tokens` still bounds as before. Without
 it a thought long enough to reach `max_tokens` ends the turn with nothing said at all.
+
+The repetition penalties carry llama.cpp's own names and its own numbers, and both samplers are
+in the chain whether or not a turn asks for them: `penalty_repeat` (1.0, off), `penalty_last_n`
+(64 tokens looked back at), `penalty_freq` (0.0), `penalty_present` (0.0), and for DRY
+`dry_multiplier` (0.0, off), `dry_base` (1.75), `dry_allowed_length` (2) and `dry_penalty_last_n`
+(64). A key nobody passes leaves that default, so a caller that asks for nothing samples exactly
+as before. They are what a turn reaches for when a model starts saying the same line twice —
+`penalty_repeat` around 1.1 for single tokens, `dry_multiplier` around 0.8 for a phrase that
+comes back whole.
 
 `last_timings()` answers `load_ms`, `prompt_ms`, `first_piece_ms`, `generate_ms`,
 `total_ms`, `prompt_tokens`, `reused_tokens` (the prefix already in the context),
