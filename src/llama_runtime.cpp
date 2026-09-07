@@ -397,7 +397,8 @@ std::string canonical_address(const std::string &written) {
 //
 // One card can be two devices here -- a CUDA one and a Vulkan one over the same hardware, both
 // reporting the same address -- so the address chooses the card and this backend keeps its own
-// preference within it, which is CUDA, exactly as best_device() would have ranked them.
+// preference within it: the first CUDA device at that address, else the first of any. That tie
+// alone; the heap and discrete ranking best_device() applies has nothing to break here.
 ggml_backend_dev_t device_at(const std::string &address) {
     const std::string wanted = canonical_address(address);
     if (wanted.empty()) {
