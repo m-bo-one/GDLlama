@@ -10,6 +10,7 @@
 #include "log.h"
 
 #include <atomic>
+#include <cctype>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -351,6 +352,44 @@ const char *device_type_name(enum ggml_backend_dev_type type) {
     }
 }
 
+// Whether what stands at this position is the mark a virtual device carries -- "-v" and a number,
+// which the CUDA backend appends to keep several devices over one card apart.
+bool is_a_virtual_tail(const std::string &address, size_t at) {
+    if (at + 2 >= address.size()) {
+        return false;
+    }
+    for (size_t i = at + 2; i < address.size(); i++) {
+        if (isdigit((unsigned char)address[i]) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// One PCI address, in the one spelling this file compares. Three are in the wild and all three
+// name the same card: the four-digit domain both backends write, the eight-digit one nvidia-smi
+// prints, and a "-v<i>" tail on a virtual device. Lower case, trimmed, domain cut to four digits.
+std::string canonical_address(const std::string &written) {
+    std::string address;
+    for (char one : written) {
+        address += (char)tolower((unsigned char)one);
+    }
+    const size_t first = address.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return std::string();
+    }
+    address = address.substr(first, address.find_last_not_of(" \t\r\n") + 1 - first);
+    const size_t tail = address.rfind("-v");
+    if (tail != std::string::npos && is_a_virtual_tail(address, tail)) {
+        address.erase(tail);
+    }
+    const size_t colon = address.find(':');
+    if (colon != std::string::npos && colon > 4) {
+        address.erase(0, colon - 4);
+    }
+    return address;
+}
+
 // The device whose PCI address is the one asked for, or null where none carries it. It is the
 // only identity two libraries in one process can both produce: a name is shared by two cards of a
 // model, and an index is a position each of them walks for itself.
@@ -359,7 +398,8 @@ const char *device_type_name(enum ggml_backend_dev_type type) {
 // reporting the same address -- so the address chooses the card and this backend keeps its own
 // preference within it, which is CUDA, exactly as best_device() would have ranked them.
 ggml_backend_dev_t device_at(const std::string &address) {
-    if (address.empty()) {
+    const std::string wanted = canonical_address(address);
+    if (wanted.empty()) {
         return nullptr;
     }
     ggml_backend_dev_t found = nullptr;
@@ -367,7 +407,7 @@ ggml_backend_dev_t device_at(const std::string &address) {
         ggml_backend_dev_t device = ggml_backend_dev_get(i);
         ggml_backend_dev_props props = {};
         ggml_backend_dev_get_props(device, &props);
-        if (props.device_id == nullptr || address != props.device_id) {
+        if (props.device_id == nullptr || wanted != canonical_address(props.device_id)) {
             continue;
         }
         if (found == nullptr || backend_name_of(device) == "CUDA") {
@@ -425,15 +465,16 @@ ggml_backend_dev_t best_device() {
     return best;
 }
 
-// The PCI address a device reports, or "" where it reports none. It is what a host holds against
-// another library's answer to know the two are on one card.
+// The PCI address a device reports, in the one spelling this file compares. It is what a host
+// holds against another library's answer to know the two are on one card, so it is canonical
+// here: a virtual device's "-v<i>" tail would otherwise read as a card the other library lacks.
 std::string address_of(ggml_backend_dev_t device) {
     if (device == nullptr) {
         return std::string();
     }
     ggml_backend_dev_props props = {};
     ggml_backend_dev_get_props(device, &props);
-    return props.device_id == nullptr ? std::string() : std::string(props.device_id);
+    return props.device_id == nullptr ? std::string() : canonical_address(props.device_id);
 }
 
 std::string describe_device(ggml_backend_dev_t device) {
