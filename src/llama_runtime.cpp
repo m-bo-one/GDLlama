@@ -443,8 +443,9 @@ ggml_backend_dev_t best_device(const std::string &wanted) {
         // library's ranking, a driver reporting no PCI address -- and one ranked here is better
         // than none. A host reading this knows the two libraries are on different cards.
         UtilityFunctions::push_warning(
-                "LlamaRuntime: no device at \"" + to_gd(wanted) + "\", so one was ranked here "
-                "instead. A caller that named it to another library is then on two cards.");
+                "LlamaRuntime: no device at \"" + to_gd(wanted) + "\" (compared as \""
+                + to_gd(address) + "\"), so one was ranked here instead. A caller that named it "
+                "to another library is then on two cards.");
     }
     return best_device();
 }
