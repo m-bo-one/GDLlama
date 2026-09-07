@@ -52,6 +52,12 @@ void note_device(ggml_backend_dev_t device);
 // preferred because it is the only backend that runs the speech codec's graph.
 ggml_backend_dev_t best_device();
 
+// The device at one PCI address -- "0000:c1:00.0" -- or the best one this backend ranks where
+// nothing carries it, with a line in the log saying so. It is how a host that runs a second
+// library keeps both of them on one card rather than spending two.
+ggml_backend_dev_t best_device(const std::string &wanted);
+ggml_backend_dev_t device_at(const std::string &address);
+
 // One device's backend name ("CUDA", "Vulkan"), and the word its type is reported by.
 std::string backend_name_of(ggml_backend_dev_t device);
 const char *device_type_name(enum ggml_backend_dev_type type);

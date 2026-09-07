@@ -151,6 +151,12 @@ protected:
     static void _bind_methods();
 
 public:
+    // The PCI address of the card this model is to take -- "0000:c1:00.0" -- set before the load
+    // and read at it. Empty is this library's own ranking, which is what a host that runs nothing
+    // else beside it wants; a host running a second library names one card for both.
+    void set_device_selector(const godot::String &address);
+    godot::String get_device_selector() const;
+
     LlamaChat() = default;
     ~LlamaChat();
 
@@ -202,6 +208,9 @@ public:
     static void shutdown_backends();
 
 private:
+
+    // The card a host named for every library in the process, or empty for this one's own choice.
+    std::string device_selector_;
     static bool ensure_backends();
 
     void remember_what_it_holds();
