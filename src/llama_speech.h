@@ -137,6 +137,10 @@ public:
     void set_device_selector(const godot::String &address);
     godot::String get_device_selector() const;
 
+    // The PCI address of the device this model is actually on, or "" where it is on
+    // none. A host holds it against the other library's answer: one address is one card.
+    godot::String device_identity() const;
+
     LlamaSpeech() = default;
     ~LlamaSpeech();
 

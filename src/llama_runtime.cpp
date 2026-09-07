@@ -354,19 +354,27 @@ const char *device_type_name(enum ggml_backend_dev_type type) {
 // The device whose PCI address is the one asked for, or null where none carries it. It is the
 // only identity two libraries in one process can both produce: a name is shared by two cards of a
 // model, and an index is a position each of them walks for itself.
+//
+// One card can be two devices here -- a CUDA one and a Vulkan one over the same hardware, both
+// reporting the same address -- so the address chooses the card and this backend keeps its own
+// preference within it, which is CUDA, exactly as best_device() would have ranked them.
 ggml_backend_dev_t device_at(const std::string &address) {
     if (address.empty()) {
         return nullptr;
     }
+    ggml_backend_dev_t found = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t device = ggml_backend_dev_get(i);
         ggml_backend_dev_props props = {};
         ggml_backend_dev_get_props(device, &props);
-        if (props.device_id != nullptr && address == props.device_id) {
-            return device;
+        if (props.device_id == nullptr || address != props.device_id) {
+            continue;
+        }
+        if (found == nullptr || backend_name_of(device) == "CUDA") {
+            found = device;
         }
     }
-    return nullptr;
+    return found;
 }
 
 ggml_backend_dev_t best_device(const std::string &wanted) {
@@ -374,14 +382,14 @@ ggml_backend_dev_t best_device(const std::string &wanted) {
     if (named != nullptr) {
         return named;
     }
-    if (!wanted.empty()) {
+    static std::atomic<bool> said{false};
+    if (!wanted.empty() && !said.exchange(true)) {
         // Said once and not obeyed: the caller named a card this backend cannot see -- another
         // library's ranking, a driver reporting no PCI address -- and one ranked here is better
         // than none. A host reading this knows the two libraries are on different cards.
-        godot::UtilityFunctions::push_warning(
-                godot::String("Govorilka: no device at ") + godot::String(wanted.c_str())
-                + godot::String(", so this library ranked one of its own. Two libraries in this "
-                                "process are then on two cards."));
+        UtilityFunctions::push_warning(
+                "LlamaRuntime: no device at \"" + to_gd(wanted) + "\", so one was ranked here "
+                "instead. A caller that named it to another library is then on two cards.");
     }
     return best_device();
 }
@@ -415,6 +423,17 @@ ggml_backend_dev_t best_device() {
         }
     }
     return best;
+}
+
+// The PCI address a device reports, or "" where it reports none. It is what a host holds against
+// another library's answer to know the two are on one card.
+std::string address_of(ggml_backend_dev_t device) {
+    if (device == nullptr) {
+        return std::string();
+    }
+    ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(device, &props);
+    return props.device_id == nullptr ? std::string() : std::string(props.device_id);
 }
 
 std::string describe_device(ggml_backend_dev_t device) {

@@ -1039,9 +1039,16 @@ godot::String LlamaChat::get_device_selector() const {
     return godot::String(device_selector_.c_str());
 }
 
+// The card this model really went to, as the address every backend that reports one writes the
+// same way. Empty before a load and from a model on the processor, which is on no card.
+godot::String LlamaChat::device_identity() const {
+    return godot::String(llama_runtime::address_of(device).c_str());
+}
+
 void LlamaChat::_bind_methods() {
     ClassDB::bind_method(D_METHOD("set_device_selector", "address"), &LlamaChat::set_device_selector);
     ClassDB::bind_method(D_METHOD("get_device_selector"), &LlamaChat::get_device_selector);
+    ClassDB::bind_method(D_METHOD("device_identity"), &LlamaChat::device_identity);
     ClassDB::bind_method(D_METHOD("load", "model_path", "n_ctx", "n_threads", "n_gpu_layers"), &LlamaChat::load);
     ClassDB::bind_method(D_METHOD("unload"), &LlamaChat::unload);
     ClassDB::bind_method(D_METHOD("is_loaded"), &LlamaChat::is_loaded);
