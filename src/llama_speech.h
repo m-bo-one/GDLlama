@@ -177,6 +177,12 @@ public:
     // Whether llama.cpp's own log lines below warning level reach the console.
     static void set_verbose(bool on);
 
+    // What a reference clip may be, answered by the half that actually decodes one so a caller
+    // never keeps a second copy of the list: the container suffixes, and the test on a clip's
+    // first bytes. Static -- a caller asks before there is a model to ask.
+    static PackedStringArray readable_clip_formats();
+    static bool is_readable_clip(const PackedByteArray &clip);
+
 private:
     void remember_what_it_holds();
     void warm_up();
