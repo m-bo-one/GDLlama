@@ -17,6 +17,7 @@
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <set>
 #include <string>
 
 
@@ -417,13 +418,23 @@ ggml_backend_dev_t device_at(const std::string &address) {
     return found;
 }
 
+// Whether nothing has been said about this address yet, marking it as it answers. Keyed by the
+// address rather than latched once for the process: two models told two different cards that are
+// not there is two problems, and the second one silent reads as a load that got what it asked for.
+bool is_the_first_word_about(const std::string &address) {
+    static std::mutex said_lock;
+    static std::set<std::string> said_about;
+    std::lock_guard<std::mutex> held(said_lock);
+    return said_about.insert(address).second;
+}
+
 ggml_backend_dev_t best_device(const std::string &wanted) {
     ggml_backend_dev_t named = device_at(wanted);
     if (named != nullptr) {
         return named;
     }
-    static std::atomic<bool> said{false};
-    if (!wanted.empty() && !said.exchange(true)) {
+    const std::string address = canonical_address(wanted);
+    if (!address.empty() && is_the_first_word_about(address)) {
         // Said once and not obeyed: the caller named a card this backend cannot see -- another
         // library's ranking, a driver reporting no PCI address -- and one ranked here is better
         // than none. A host reading this knows the two libraries are on different cards.
