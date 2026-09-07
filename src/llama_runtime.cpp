@@ -411,7 +411,11 @@ ggml_backend_dev_t device_at(const std::string &address) {
         if (props.device_id == nullptr || wanted != canonical_address(props.device_id)) {
             continue;
         }
-        if (found == nullptr || backend_name_of(device) == "CUDA") {
+        if (found == nullptr) {
+            found = device;
+            continue;
+        }
+        if (backend_name_of(found) != "CUDA" && backend_name_of(device) == "CUDA") {
             found = device;
         }
     }
