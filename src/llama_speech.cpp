@@ -514,6 +514,45 @@ void LlamaSpeech::set_verbose(bool on) {
     llama_runtime::set_verbose(on);
 }
 
+// What the multimodal helper accepts as audio, kept in the one file that hands it a clip.
+//
+// It cannot be read off the helper: the sniff there is a translation-unit-local function with
+// no declaration in any header and nothing in the API answers the question, so a caller that
+// wants the list has to be told it. This is that telling, and it is the only copy in the
+// project -- the addon above asks rather than writing the list down a second time. Held level
+// with the pin the extension is built against; a container the helper learns later is added
+// here, beside the call, rather than in whatever asked.
+static const char *const READABLE_CLIP_SUFFIXES[] = {"wav", "mp3", "flac"};
+
+// The fewest bytes the sniff below can decide on, and the mp3 sync word: eleven set bits, of
+// which the first two bytes carry the top eight and three.
+static constexpr int64_t LEAST_CLIP_BYTES = 12;
+static constexpr uint8_t MPEG_SYNC = 0xFF;
+static constexpr uint8_t MPEG_SYNC_MASK = 0xE0;
+
+PackedStringArray LlamaSpeech::readable_clip_formats() {
+    PackedStringArray formats;
+    for (const char *suffix : READABLE_CLIP_SUFFIXES) {
+        formats.push_back(String(suffix));
+    }
+    return formats;
+}
+
+// Whether the helper will read these bytes as audio rather than hand them to the image decoder.
+// The head of the file decides it and the name never does, so this answers for a clip a game
+// holds in memory and has not named. A true here is not a promise the decoder will succeed.
+bool LlamaSpeech::is_readable_clip(const PackedByteArray &clip) {
+    if (clip.size() < LEAST_CLIP_BYTES) {
+        return false;
+    }
+    const uint8_t *buf = clip.ptr();
+    const bool is_wav = memcmp(buf, "RIFF", 4) == 0 && memcmp(buf + 8, "WAVE", 4) == 0;
+    const bool is_mp3 = memcmp(buf, "ID3", 3) == 0
+            || (buf[0] == MPEG_SYNC && (buf[1] & MPEG_SYNC_MASK) == MPEG_SYNC_MASK);
+    const bool is_flac = memcmp(buf, "fLaC", 4) == 0;
+    return is_wav || is_mp3 || is_flac;
+}
+
 // The reference clip decoded, resampled and kept as the bitmap the speaker encoder reads. One
 // path is read once however many sentences it speaks: the decode is milliseconds, but a clip
 // re-read per sentence is a file opened in the middle of a conversation.
@@ -744,6 +783,10 @@ void LlamaSpeech::_bind_methods() {
     ClassDB::bind_method(D_METHOD("device_memory"), &LlamaSpeech::device_memory);
     ClassDB::bind_method(D_METHOD("describe_devices"), &LlamaSpeech::describe_devices);
     ClassDB::bind_static_method("LlamaSpeech", D_METHOD("set_verbose", "on"), &LlamaSpeech::set_verbose);
+    ClassDB::bind_static_method("LlamaSpeech", D_METHOD("readable_clip_formats"),
+            &LlamaSpeech::readable_clip_formats);
+    ClassDB::bind_static_method("LlamaSpeech", D_METHOD("is_readable_clip", "clip"),
+            &LlamaSpeech::is_readable_clip);
 
     ADD_SIGNAL(MethodInfo("synthesised", PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "samples"),
             PropertyInfo(Variant::INT, "rate")));
