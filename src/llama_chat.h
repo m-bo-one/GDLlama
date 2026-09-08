@@ -127,6 +127,18 @@ class LlamaChat : public RefCounted {
     std::atomic<int> kv_tokens{0};
     int context_tokens = 0;
     int n_batch = 512;
+    int n_ubatch = 512;
+
+    // A sliding window that keeps every position rather than the model's own thousand. On a
+    // model with such layers the short window silently empties whenever a turn generated more
+    // tokens than it holds, and the prefix the next turn keeps is then a prefix of nothing.
+    bool swa_full = true;
+
+    // What the cache is stored as, and whether flash attention is forced either way. A
+    // quantized V needs flash attention; asked for without it the context refuses to open.
+    ggml_type cache_type_k = GGML_TYPE_F16;
+    ggml_type cache_type_v = GGML_TYPE_F16;
+    llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
 
     // Identifiers for calls the template leaves unnamed, unique for the life of the object.
     int64_t call_serial = 0;
@@ -153,6 +165,16 @@ protected:
 public:
     LlamaChat() = default;
     ~LlamaChat();
+
+    // What the next load opens the context with, beyond its four numbers: swa_full,
+    // n_batch, n_ubatch, cache_type_k, cache_type_v ("f16", "q8_0", …) and flash_attn
+    // ("auto", "on", "off"). A key that is absent leaves that knob where it stands, and a
+    // value that is not one of the words is refused with a sentence rather than guessed at.
+    // Read at the next load and never during one, so a model already open does not move.
+    bool set_load_options(const Dictionary &options);
+
+    // What the load actually opened the context with, the six above and the four numbers.
+    Dictionary load_report() const;
 
     // A .gguf file, or the folder holding exactly one; an OS path or a res:// or user:// one.
     bool load(const String &model_path, int n_ctx, int n_threads, int n_gpu_layers);

@@ -184,6 +184,21 @@ bool read_tools(const Array &tools, std::vector<common_chat_tool> &out, String &
     return true;
 }
 
+// The cache types llama.cpp's own command line takes, by the names ggml gives them. Anything
+// else is refused: a type the kernels have no path for opens a context that then fails to run.
+bool cache_type_named(const String &word, ggml_type &named) {
+    static const ggml_type allowed[] = { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0,
+        GGML_TYPE_IQ4_NL };
+    for (const ggml_type type : allowed) {
+        if (word == String(ggml_type_name(type))) {
+            named = type;
+            return true;
+        }
+    }
+    return false;
+}
+
 // Where the bytes from `from` stop being whole UTF-8 sequences: the size, or the start of a
 // sequence whose tail has not arrived. A piece cut inside a letter reads as a broken glyph.
 size_t utf8_complete_end(const std::string &text, size_t from) {
@@ -300,6 +315,82 @@ void LlamaChat::set_verbose(bool on) {
     llama_runtime::set_verbose(on);
 }
 
+// The knobs of the next load. Refused whole rather than in part: a dictionary half of which
+// was taken would open a context nobody asked for and report the half that landed.
+bool LlamaChat::set_load_options(const Dictionary &options) {
+    bool wants_swa_full = swa_full;
+    int wants_batch = n_batch;
+    int wants_ubatch = n_ubatch;
+    ggml_type wants_k = cache_type_k;
+    ggml_type wants_v = cache_type_v;
+    llama_flash_attn_type wants_fa = flash_attn_type;
+
+    const Array keys = options.keys();
+    for (int i = 0; i < keys.size(); i++) {
+        const String key = keys[i];
+        const Variant value = options[keys[i]];
+        if (key == "swa_full") {
+            wants_swa_full = value;
+        } else if (key == "n_batch") {
+            wants_batch = value;
+        } else if (key == "n_ubatch") {
+            wants_ubatch = value;
+        } else if (key == "cache_type_k" || key == "cache_type_v") {
+            ggml_type named = GGML_TYPE_COUNT;
+            if (!cache_type_named(String(value), named)) {
+                UtilityFunctions::push_error("LlamaChat: \"" + String(value) + "\" is not a cache "
+                        "type. f32, f16, bf16, q8_0, q5_1, q5_0, q4_1, q4_0 and iq4_nl are.");
+                return false;
+            }
+            (key == "cache_type_k" ? wants_k : wants_v) = named;
+        } else if (key == "flash_attn") {
+            const String word = String(value);
+            if (word == "auto") {
+                wants_fa = LLAMA_FLASH_ATTN_TYPE_AUTO;
+            } else if (word == "on") {
+                wants_fa = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            } else if (word == "off") {
+                wants_fa = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            } else {
+                UtilityFunctions::push_error("LlamaChat: flash_attn is \"" + word
+                        + "\"; auto, on and off are the words.");
+                return false;
+            }
+        } else {
+            UtilityFunctions::push_error("LlamaChat: \"" + key + "\" is not a load option. "
+                    "swa_full, n_batch, n_ubatch, cache_type_k, cache_type_v and flash_attn are.");
+            return false;
+        }
+    }
+    if (wants_batch < 1 || wants_ubatch < 1 || wants_ubatch > wants_batch) {
+        UtilityFunctions::push_error(vformat("LlamaChat: n_batch %d and n_ubatch %d are not a "
+                "pair: both are above zero and the micro-batch is no wider than the batch.",
+                wants_batch, wants_ubatch));
+        return false;
+    }
+
+    swa_full = wants_swa_full;
+    n_batch = wants_batch;
+    n_ubatch = wants_ubatch;
+    cache_type_k = wants_k;
+    cache_type_v = wants_v;
+    flash_attn_type = wants_fa;
+    return true;
+}
+
+Dictionary LlamaChat::load_report() const {
+    Dictionary out;
+    out["swa_full"] = swa_full;
+    out["n_batch"] = n_batch;
+    out["n_ubatch"] = n_ubatch;
+    out["cache_type_k"] = String(ggml_type_name(cache_type_k));
+    out["cache_type_v"] = String(ggml_type_name(cache_type_v));
+    out["flash_attn"] = String(llama_flash_attn_type_name(flash_attn_type));
+    out["context_size"] = context_tokens;
+    out["device"] = to_gd(chosen_device);
+    return out;
+}
+
 // The model and one context for it. A negative layer count puts every layer on the GPU with
 // the most memory; zero keeps the whole model on the CPU. The load waits for a turn in
 // flight, the way unload() does, and the context is warmed up so the first turn's time is
@@ -327,10 +418,17 @@ bool LlamaChat::load(const String &model_path, int n_ctx, int n_threads, int n_g
     params.model.path = to_std(path);
     params.n_ctx = n_ctx > 0 ? n_ctx : 4096;
     params.n_batch = n_batch;
-    params.n_ubatch = n_batch;
+    params.n_ubatch = n_ubatch;
     params.n_gpu_layers = n_gpu_layers < 0 ? -1 : n_gpu_layers;
     params.fit_params = false;
     params.warmup = false;
+    // The sliding-window layers keep the whole window rather than the model's own thousand.
+    // Left short, llama.cpp empties them as soon as a turn generated more than the window
+    // holds and says nothing, so the next turn reuses a prefix those layers no longer have.
+    params.swa_full = swa_full;
+    params.cache_type_k = cache_type_k;
+    params.cache_type_v = cache_type_v;
+    params.flash_attn_type = flash_attn_type;
     const int threads = n_threads > 0 ? n_threads : std::max(1, (int)std::thread::hardware_concurrency() / 2);
     params.cpuparams.n_threads = threads;
     params.cpuparams_batch.n_threads = threads;
@@ -1030,6 +1128,8 @@ void LlamaChat::join_worker() {
 }
 
 void LlamaChat::_bind_methods() {
+    ClassDB::bind_method(D_METHOD("set_load_options", "options"), &LlamaChat::set_load_options);
+    ClassDB::bind_method(D_METHOD("load_report"), &LlamaChat::load_report);
     ClassDB::bind_method(D_METHOD("load", "model_path", "n_ctx", "n_threads", "n_gpu_layers"), &LlamaChat::load);
     ClassDB::bind_method(D_METHOD("unload"), &LlamaChat::unload);
     ClassDB::bind_method(D_METHOD("is_loaded"), &LlamaChat::is_loaded);
