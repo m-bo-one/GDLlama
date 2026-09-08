@@ -173,7 +173,9 @@ public:
     // Read at the next load and never during one, so a model already open does not move.
     bool set_load_options(const Dictionary &options);
 
-    // What the load actually opened the context with, the six above and the four numbers.
+    // What the load was ASKED for -- the six above and the four numbers -- and not what the
+    // library resolved: flash_attn stays "auto" where the probe decided it, and llama.cpp
+    // exposes no getter for the resolved value. Its own log line is where that is read.
     Dictionary load_report() const;
 
     // A .gguf file, or the folder holding exactly one; an OS path or a res:// or user:// one.
