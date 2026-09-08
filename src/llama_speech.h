@@ -131,6 +131,16 @@ protected:
     static void _bind_methods();
 
 public:
+    // The PCI address of the card this model is to take -- "0000:c1:00.0" -- set before the load
+    // and read at it. Empty is this library's own ranking, which is what a host that runs nothing
+    // else beside it wants; a host running a second library names one card for both.
+    void set_device_selector(const godot::String &address);
+    godot::String get_device_selector() const;
+
+    // The PCI address of the device this model is actually on, or "" where it is on
+    // none. A host holds it against the other library's answer: one address is one card.
+    godot::String device_identity() const;
+
     LlamaSpeech() = default;
     ~LlamaSpeech();
 
@@ -184,6 +194,9 @@ public:
     static bool is_readable_clip(const PackedByteArray &clip);
 
 private:
+
+    // The card a host named for every library in the process, or empty for this one's own choice.
+    std::string device_selector_;
     void remember_what_it_holds();
     void warm_up();
     void work(LlamaSpeechTurn turn, int64_t at);

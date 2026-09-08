@@ -190,7 +190,7 @@ bool LlamaSpeech::load(const String &model_folder, int n_ctx, int n_threads, int
     params.devices = { nullptr };
     ggml_backend_dev_t best = nullptr;
     if (params.n_gpu_layers != 0) {
-        best = llama_runtime::best_device();
+        best = llama_runtime::best_device(device_selector_);
         if (best != nullptr) {
             params.devices = { best, nullptr };
             // Read the file rather than map it, for the reason llama_chat.cpp gives: mapped,
@@ -505,7 +505,7 @@ Dictionary LlamaSpeech::device_memory() {
     // The backends are opened here rather than assumed: before the first load nothing else has
     // opened them, and an unopened registry has no devices at all to answer about.
     if (asked == nullptr && !loaded.load() && llama_runtime::ensure_backends()) {
-        asked = llama_runtime::best_device();
+        asked = llama_runtime::best_device(device_selector_);
     }
     return llama_runtime::device_memory_of(asked);
 }
@@ -748,7 +748,26 @@ void LlamaSpeech::join_worker() {
     }
 }
 
+// The card a host names for every library in the process. It is read at the load and never
+// after: a model already on a device stays where it was put.
+void LlamaSpeech::set_device_selector(const godot::String &address) {
+    device_selector_ = address.utf8().get_data();
+}
+
+godot::String LlamaSpeech::get_device_selector() const {
+    return godot::String(device_selector_.c_str());
+}
+
+// The card this model really went to, as the address every backend that reports one writes the
+// same way. Empty before a load and from a model on the processor, which is on no card.
+godot::String LlamaSpeech::device_identity() const {
+    return godot::String(llama_runtime::address_of(device).c_str());
+}
+
 void LlamaSpeech::_bind_methods() {
+    ClassDB::bind_method(D_METHOD("set_device_selector", "address"), &LlamaSpeech::set_device_selector);
+    ClassDB::bind_method(D_METHOD("get_device_selector"), &LlamaSpeech::get_device_selector);
+    ClassDB::bind_method(D_METHOD("device_identity"), &LlamaSpeech::device_identity);
     ClassDB::bind_method(D_METHOD("load", "model_folder", "n_ctx", "n_threads", "n_gpu_layers"), &LlamaSpeech::load);
     ClassDB::bind_method(D_METHOD("unload"), &LlamaSpeech::unload);
     ClassDB::bind_method(D_METHOD("is_loaded"), &LlamaSpeech::is_loaded);
