@@ -36,20 +36,36 @@ chat.generate(messages, tools, {"temperature": 0.7, "top_p": 0.8, "max_tokens": 
 
 - `load(model_path, n_ctx, n_threads, n_gpu_layers) -> bool` — an OS path or a `res://` /
   `user://` one. `n_gpu_layers = -1` puts every layer on the largest GPU, `0` keeps the model
-  on the CPU. One `llama_context` lives as long as the model is loaded. The KV cache is f16.
-- `generate(messages, tools, options) -> bool` — messages in the OpenAI chat shape (`role`,
-  `content`; `tool_calls` on an assistant turn; `tool_call_id` on a `tool` turn), tools as
-  OpenAI function declarations, options `temperature`, `top_p`, `top_k`, `min_p`,
+  on the CPU. One `llama_context` lives as long as the model is loaded, carrying as many
+  sequences as `slots` asked for; they **share** the context's tokens rather than dividing
+  them, so one conversation may hold the whole of `n_ctx` while the others hold nothing.
+- `set_load_options(options) -> bool` — read at the next load and never during one:
+  `slots` (sequences the context opens with, 1), `swa_full` (a sliding window kept whole),
+  `n_batch`, `n_ubatch`, `cache_type_k` / `cache_type_v` (`"f16"`, `"q8_0"`, …) and
+  `flash_attn` (`"auto"`, `"on"`, `"off"`). A key that is absent leaves that knob where it
+  stands; a value that is not one of the words is refused with a sentence rather than guessed
+  at, and the whole dictionary with it. `load_report()` answers what the load was asked for.
+- `generate(messages, tools, options, slot = 0) -> bool` — messages in the OpenAI chat shape
+  (`role`, `content`; `tool_calls` on an assistant turn; `tool_call_id` on a `tool` turn),
+  tools as OpenAI function declarations, options `temperature`, `top_p`, `top_k`, `min_p`,
   `max_tokens`, `thinking_budget`, `seed`, `enable_thinking`, `parallel_tool_calls`,
-  `json_schema`, and the repetition penalties below. Refuses while a turn runs.
+  `json_schema`, and the repetition penalties below. `slot` is which sequence of the context
+  answers: a turn compares its prompt against that sequence's tokens and decodes only the tail
+  past the first difference, so a conversation coming back to its own slot pays for what it
+  added. Refuses while a turn runs, and where the slot is not one the context has.
 - `cancel()` — never blocks; the running turn ends with `finished("cancelled", ...)`.
 - `deliver_pending()` — hands out every signal the worker has queued, on the calling
   thread. The engine calls it deferred after each burst, so a game never needs to; a
   caller that draws no frames — a headless test, a tool — calls it itself.
 - `wait_for_turn(timeout_ms) -> bool` — blocks, draining as it waits, until the turn in
   flight has been handed out or the wait runs out. For frameless callers only.
-- `unload()`, `is_loaded()`, `is_busy()`, `context_size()`, `cached_tokens()`,
-  `last_timings()`, `describe_devices()`, `LlamaChat.set_verbose(on)`.
+- `slot_count()` — how many sequences the open context has, or how many the next load asks
+  for; `empty_slots()` — how many of them carry no tokens at all, which is about the cache and
+  not about who is seated where: which conversation owns which slot is the caller's own book.
+  `drop_slot(slot)` clears one sequence's tokens, so the next turn there starts from nothing;
+  a slot dropped while a turn runs is cleared in front of the next one.
+- `unload()`, `is_loaded()`, `is_busy()`, `context_size()`, `cached_tokens(slot)`,
+  `last_timings(slot)`, `describe_devices()`, `LlamaChat.set_verbose(on)`.
 - Signals, all on the main thread and in the order the worker produced them:
   `piece_arrived(text)` — visible text only, whole UTF-8 letters;
   `tool_called(id, name, arguments_json)` — after the reply ended cleanly;
@@ -78,7 +94,9 @@ comes back whole.
 `decoded_tokens` (what this turn actually decoded), `completion_tokens`, `reasoning_tokens`
 (the part of them the thought took, counted whether or not a budget was given, and readable
 from the `finished` handler because the turn's cost is written before the signal goes out),
-`tokens_per_second`, `prompt_tokens_per_second`, `device`, `context_size`.
+`tokens_per_second`, `prompt_tokens_per_second`, `device`, `context_size`. It is per slot, and
+a refused turn writes its row as well — what it reached before it was refused — so a reading
+taken after a refusal is that turn's and never the one before it.
 
 ## Building on Windows (MSVC + Ninja)
 
