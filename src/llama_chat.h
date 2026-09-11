@@ -102,7 +102,7 @@ struct LlamaSlot {
 //
 // The context carries several sequences, one per slot, and several conversations answer through
 // it without reading each other's prompts: a slot keeps its own tokens, its own positions and
-// its own reuse, and the context's tokens are divided between the slots rather than added to.
+// its own reuse, and the context's tokens are one budget the occupied slots draw from.
 //
 // generate() hands the turn to one worker thread and refuses while one runs. The worker
 // queues what it has to say on the object; a deferred call drains the queue on the main
@@ -147,7 +147,8 @@ class LlamaChat : public RefCounted {
     std::vector<std::unique_ptr<LlamaSlot>> slots;
 
     // How many sequences the next load opens the context with, and how many the open one has.
-    // The context's tokens are divided by it, so context_tokens below is one slot's own share.
+    // The slots share one cache of the context's tokens, so context_tokens below is the whole
+    // of it and what a conversation may hold is bounded by what the others are holding.
     int slots_asked = 1;
 
     int context_tokens = 0;
@@ -248,8 +249,8 @@ public:
     bool wait_for_turn(int timeout_ms);
 
     // What the last turn of one slot cost, and how many tokens of it the cache holds. The
-    // context size is one slot's own share of the context, which is what a prompt is measured
-    // against, and the same number as the whole context where the load asked for one slot.
+    // context size is the whole context, which is what a prompt is measured against: the slots
+    // share those tokens rather than each being given a fixed part of them.
     Dictionary last_timings(int slot = 0) const;
     int context_size() const;
     int cached_tokens(int slot = 0) const;

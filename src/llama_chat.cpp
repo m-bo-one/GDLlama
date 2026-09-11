@@ -431,9 +431,12 @@ bool LlamaChat::load(const String &model_path, int n_ctx, int n_threads, int n_g
     params.n_ctx = n_ctx > 0 ? n_ctx : 4096;
     params.n_batch = n_batch;
     params.n_ubatch = n_ubatch;
-    // The sequences the context carries. The library divides n_ctx between them and rounds each
-    // share down to a multiple of 256, so what a slot holds is llama_n_ctx_seq() and not n_ctx.
+    // The sequences the context carries, and the one cache they all draw from. Left to itself
+    // the library gives each sequence n_ctx divided by their number, which fixes in advance what
+    // a conversation may ever hold; unified, n_ctx is a budget the occupied slots share, and a
+    // long room stands beside a short exchange without either being sized for the other.
     params.n_parallel = slots_asked;
+    params.kv_unified = true;
     params.n_gpu_layers = n_gpu_layers < 0 ? -1 : n_gpu_layers;
     params.fit_params = false;
     params.warmup = false;
@@ -499,8 +502,9 @@ bool LlamaChat::load(const String &model_path, int n_ctx, int n_threads, int n_g
         vocab = nullptr;
         return false;
     }
-    // One slot's own share of the context, which is what a prompt is measured against. The
-    // library's number rather than the division: it rounds a share down to a multiple of 256.
+    // What one slot may hold, which with the one shared cache is the whole context: the ceiling
+    // a prompt is measured against. Asked of the library rather than worked out, because it is
+    // the library that decides whether the slots share the tokens or divide them.
     context_tokens = (int)llama_n_ctx_seq(ctx);
     llama_runtime::note_operation("LlamaChat was warming the model up");
     warm_up(params.n_gpu_layers != 0);
@@ -917,8 +921,8 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
         return;
     }
     if ((int)prompt.size() + 1 > context_tokens) {
-        fail(vformat("LlamaChat: the prompt is %d tokens and this slot of the context holds %d.",
-                (int)prompt.size(), context_tokens));
+        fail(vformat("LlamaChat: the prompt is %d tokens and the context holds %d, which the %d "
+                "slot(s) share.", (int)prompt.size(), context_tokens, (int)slots.size()));
         return;
     }
 
@@ -961,7 +965,8 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
             common_batch_add(batch, prompt[i], (llama_pos)i, { sequence }, i + 1 == prompt.size());
         }
         if (llama_decode(ctx, batch) != 0) {
-            fail("LlamaChat: the prompt could not be decoded; this slot of the context may be too small for it.");
+            fail("LlamaChat: the prompt could not be decoded; the context may be too small for "
+                 "it, or too much of it is held by the other slots.");
             return;
         }
         for (size_t i = from; i < to; i++) {
@@ -1155,7 +1160,8 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
         common_batch_clear(batch);
         common_batch_add(batch, token, (llama_pos)slot.cached.size(), { sequence }, true);
         if (llama_decode(ctx, batch) != 0) {
-            fail("LlamaChat: a generated token could not be decoded; this slot of the context is full.");
+            fail("LlamaChat: a generated token could not be decoded; the context is full, "
+                 "whether with this conversation or with the slots beside it.");
             return;
         }
         slot.cached.push_back(token);
