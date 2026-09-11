@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -33,6 +34,9 @@ struct LlamaTurn {
     // How many tokens the thought may spend before its end marker is forced; 0 or less leaves
     // it unbounded. Without it a long thought reaches max_tokens and the turn says nothing.
     int thinking_budget = 0;
+    // Which slot of the context this turn is decoded into. Each slot keeps its own tokens and
+    // its own positions, so a turn reads and writes nothing of the conversations beside it.
+    int slot = 0;
     // What a repetition costs this turn, under llama.cpp's own names. The penalties sampler and
     // DRY are already in the chain; at these defaults both pass everything through, so a caller
     // that asks for nothing gets the sampling it had.
@@ -79,10 +83,26 @@ struct LlamaEvent {
     int completion_tokens = 0;
 };
 
+// One slot of the context: the tokens that sequence holds, in order, how many of them the
+// cache carries, whether a clear is owed, and what the last turn run there cost. Held behind a
+// pointer so the list of them can be rebuilt at a load without moving an atomic.
+struct LlamaSlot {
+    std::vector<llama_token> cached;
+    std::atomic<int> kv_tokens{0};
+    // Raised by drop_slot() while a turn holds the model, and honoured before the next turn
+    // decodes anything. Without it a drop would either block the caller or race the worker.
+    std::atomic<bool> drop_asked{false};
+    LlamaTimings timings;
+};
+
 // A chat with one local model: the model's own chat template renders the history and the
 // tool declarations, the template's grammar constrains a call, and the template's parser
 // separates what the model says from what it calls. One llama_context lives as long as the
 // model is loaded, and a turn decodes only the tokens that differ from the ones already in it.
+//
+// The context carries several sequences, one per slot, and several conversations answer through
+// it without reading each other's prompts: a slot keeps its own tokens, its own positions and
+// its own reuse, and the context's tokens are divided between the slots rather than added to.
 //
 // generate() hands the turn to one worker thread and refuses while one runs. The worker
 // queues what it has to say on the object; a deferred call drains the queue on the main
@@ -121,10 +141,15 @@ class LlamaChat : public RefCounted {
     const llama_vocab *vocab = nullptr;
     common_chat_templates_ptr templates;
 
-    // The tokens whose entries the context holds, in order. The next turn's prompt is
-    // compared against them and only the tail past the first difference is decoded.
-    std::vector<llama_token> cached;
-    std::atomic<int> kv_tokens{0};
+    // One entry per slot, built at the load and kept across an unload so what the last turn
+    // cost can still be read. A turn compares its prompt against its own slot's tokens and
+    // decodes only the tail past the first difference.
+    std::vector<std::unique_ptr<LlamaSlot>> slots;
+
+    // How many sequences the next load opens the context with, and how many the open one has.
+    // The context's tokens are divided by it, so context_tokens below is one slot's own share.
+    int slots_asked = 1;
+
     int context_tokens = 0;
     int n_batch = 512;
     int n_ubatch = 512;
@@ -157,7 +182,8 @@ class LlamaChat : public RefCounted {
     std::atomic<int64_t> compute_bytes{0};
     std::atomic<int64_t> host_bytes{0};
 
-    LlamaTimings timings;
+    // What the load itself took, copied into every slot's timings so a turn reports it too.
+    double load_ms = 0.0;
 
 protected:
     static void _bind_methods();
@@ -176,7 +202,7 @@ public:
     LlamaChat() = default;
     ~LlamaChat();
 
-    // What the next load opens the context with, beyond its four numbers: swa_full,
+    // What the next load opens the context with, beyond its four numbers: slots, swa_full,
     // n_batch, n_ubatch, cache_type_k, cache_type_v ("f16", "q8_0", …) and flash_attn
     // ("auto", "on", "off"). A key that is absent leaves that knob where it stands, and a
     // value that is not one of the words is refused with a sentence rather than guessed at.
@@ -196,10 +222,21 @@ public:
 
     // Messages in the OpenAI chat shape, tools as OpenAI function declarations, and the
     // options temperature, top_p, top_k, min_p, max_tokens, thinking_budget, seed,
-    // enable_thinking, parallel_tool_calls, json_schema and the penalties above. False when the
-    // model is not loaded, a turn is running, or the messages do not read.
-    bool generate(const Array &messages, const Array &tools, const Dictionary &options);
+    // enable_thinking, parallel_tool_calls, json_schema and the penalties above. The slot is
+    // which conversation of the context answers; false when the model is not loaded, a turn is
+    // running, the slot is not one the context has, or the messages do not read.
+    bool generate(const Array &messages, const Array &tools, const Dictionary &options, int slot = 0);
     void cancel();
+
+    // How many conversations the context holds at once, and how many of those carry no tokens
+    // at all. A caller hands turns out by these two and by nothing else.
+    int slot_count() const;
+    int free_slots() const;
+
+    // Clears one slot's tokens out of the cache, so the next turn there starts from nothing.
+    // Answers "" when it was done or is owed, and the sentence saying why when the slot is not
+    // one the context has. A slot dropped while a turn runs is cleared before the next one.
+    String drop_slot(int slot);
 
     // Hands out every signal the worker has queued, on the calling thread, in order. The
     // engine calls it deferred after each burst; a caller that draws no frames calls it.
@@ -210,9 +247,12 @@ public:
     // no frames -- a headless test, a tool -- and never for a game, which has frames.
     bool wait_for_turn(int timeout_ms);
 
-    Dictionary last_timings() const;
+    // What the last turn of one slot cost, and how many tokens of it the cache holds. The
+    // context size is one slot's own share of the context, which is what a prompt is measured
+    // against, and the same number as the whole context where the load asked for one slot.
+    Dictionary last_timings(int slot = 0) const;
     int context_size() const;
-    int cached_tokens() const;
+    int cached_tokens(int slot = 0) const;
 
     // What this model holds, as the library counted it when the load finished: weights_bytes,
     // kv_bytes, compute_bytes, and host_bytes for the part of the three that is ordinary memory
@@ -242,6 +282,9 @@ private:
     static bool ensure_backends();
 
     void remember_what_it_holds();
+    // Clears one slot out of the cache. Called with the model lock held, and never otherwise:
+    // touching the cache beside a decoding worker is what it is there to prevent.
+    void clear_slot(int slot);
     void warm_up(bool every_width);
     void work(LlamaTurn turn, int64_t at);
     void run_turn(const LlamaTurn &turn, int64_t at);

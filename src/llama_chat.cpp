@@ -30,8 +30,9 @@ using namespace godot;
 
 namespace {
 
-// The one sequence the context holds. A second one would need its own prefix bookkeeping.
-constexpr llama_seq_id SEQUENCE = 0;
+// The slot a caller that names none answers in, which is the one a context opened for a single
+// conversation has. Every other slot is asked for by index.
+constexpr int FIRST_SLOT = 0;
 
 using clock_type = std::chrono::steady_clock;
 
@@ -319,6 +320,7 @@ void LlamaChat::set_verbose(bool on) {
 // was taken would open a context nobody asked for and report the half that landed.
 bool LlamaChat::set_load_options(const Dictionary &options) {
     bool wants_swa_full = swa_full;
+    int wants_slots = slots_asked;
     int wants_batch = n_batch;
     int wants_ubatch = n_ubatch;
     ggml_type wants_k = cache_type_k;
@@ -331,6 +333,8 @@ bool LlamaChat::set_load_options(const Dictionary &options) {
         const Variant value = options[keys[i]];
         if (key == "swa_full") {
             wants_swa_full = value;
+        } else if (key == "slots") {
+            wants_slots = value;
         } else if (key == "n_batch") {
             wants_batch = value;
         } else if (key == "n_ubatch") {
@@ -357,10 +361,16 @@ bool LlamaChat::set_load_options(const Dictionary &options) {
                 return false;
             }
         } else {
-            UtilityFunctions::push_error("LlamaChat: \"" + key + "\" is not a load option. "
+            UtilityFunctions::push_error("LlamaChat: \"" + key + "\" is not a load option. slots, "
                     "swa_full, n_batch, n_ubatch, cache_type_k, cache_type_v and flash_attn are.");
             return false;
         }
+    }
+    if (wants_slots < 1) {
+        UtilityFunctions::push_error(vformat("LlamaChat: slots is %d, and a context holds at "
+                "least one conversation. The context's tokens are divided between them.",
+                wants_slots));
+        return false;
     }
     if (wants_batch < 1 || wants_ubatch < 1 || wants_ubatch > wants_batch) {
         UtilityFunctions::push_error(vformat("LlamaChat: n_batch %d and n_ubatch %d are not a "
@@ -370,6 +380,7 @@ bool LlamaChat::set_load_options(const Dictionary &options) {
     }
 
     swa_full = wants_swa_full;
+    slots_asked = wants_slots;
     n_batch = wants_batch;
     n_ubatch = wants_ubatch;
     cache_type_k = wants_k;
@@ -381,6 +392,7 @@ bool LlamaChat::set_load_options(const Dictionary &options) {
 Dictionary LlamaChat::load_report() const {
     Dictionary out;
     out["swa_full"] = swa_full;
+    out["slots"] = slots_asked;
     out["n_batch"] = n_batch;
     out["n_ubatch"] = n_ubatch;
     out["cache_type_k"] = String(ggml_type_name(cache_type_k));
@@ -419,6 +431,9 @@ bool LlamaChat::load(const String &model_path, int n_ctx, int n_threads, int n_g
     params.n_ctx = n_ctx > 0 ? n_ctx : 4096;
     params.n_batch = n_batch;
     params.n_ubatch = n_ubatch;
+    // The sequences the context carries. The library divides n_ctx between them and rounds each
+    // share down to a multiple of 256, so what a slot holds is llama_n_ctx_seq() and not n_ctx.
+    params.n_parallel = slots_asked;
     params.n_gpu_layers = n_gpu_layers < 0 ? -1 : n_gpu_layers;
     params.fit_params = false;
     params.warmup = false;
@@ -484,16 +499,21 @@ bool LlamaChat::load(const String &model_path, int n_ctx, int n_threads, int n_g
         vocab = nullptr;
         return false;
     }
-    context_tokens = (int)llama_n_ctx(ctx);
+    // One slot's own share of the context, which is what a prompt is measured against. The
+    // library's number rather than the division: it rounds a share down to a multiple of 256.
+    context_tokens = (int)llama_n_ctx_seq(ctx);
     llama_runtime::note_operation("LlamaChat was warming the model up");
     warm_up(params.n_gpu_layers != 0);
     // After the warm-up and not before: the compute buffers are sized by the widest batch the
     // model is decoded at, and that is the batch the warm-up above has just put through it.
     remember_what_it_holds();
-    cached.clear();
-    kv_tokens.store(0);
-    timings = LlamaTimings();
-    timings.load_ms = ms_between(started, clock_type::now());
+    slots.clear();
+    load_ms = ms_between(started, clock_type::now());
+    const int opened = std::max(1, (int)llama_n_seq_max(ctx));
+    for (int i = 0; i < opened; i++) {
+        slots.push_back(std::unique_ptr<LlamaSlot>(new LlamaSlot()));
+        slots.back()->timings.load_ms = load_ms;
+    }
     loaded.store(true);
     llama_runtime::note_operation("LlamaChat was waiting for a turn");
     return true;
@@ -519,7 +539,7 @@ void LlamaChat::warm_up(bool every_width) {
     for (const int width : widths) {
         common_batch_clear(batch);
         for (int i = 0; i < width; i++) {
-            common_batch_add(batch, filler, (llama_pos)i, { SEQUENCE }, i + 1 == width);
+            common_batch_add(batch, filler, (llama_pos)i, { (llama_seq_id)FIRST_SLOT }, i + 1 == width);
         }
         llama_decode(ctx, batch);
         llama_memory_clear(llama_get_memory(ctx), true);
@@ -543,8 +563,13 @@ void LlamaChat::unload() {
         model = nullptr;
         ctx = nullptr;
         vocab = nullptr;
-        cached.clear();
-        kv_tokens.store(0);
+        // The slots themselves stay: what the last turn of each cost is still readable after
+        // the weights are gone, and what they held is not, because the cache went with them.
+        for (const std::unique_ptr<LlamaSlot> &slot : slots) {
+            slot->cached.clear();
+            slot->kv_tokens.store(0);
+            slot->drop_asked.store(false);
+        }
         weights_bytes.store(0);
         kv_bytes.store(0);
         compute_bytes.store(0);
@@ -570,7 +595,7 @@ bool LlamaChat::is_busy() const {
     return busy.load();
 }
 
-bool LlamaChat::generate(const Array &messages, const Array &tools, const Dictionary &options) {
+bool LlamaChat::generate(const Array &messages, const Array &tools, const Dictionary &options, int slot) {
     BusyGuard guard(busy);
     if (!guard.taken()) {
         UtilityFunctions::push_error("LlamaChat: a turn is still running; wait for finished or cancel it.");
@@ -580,8 +605,14 @@ bool LlamaChat::generate(const Array &messages, const Array &tools, const Dictio
         UtilityFunctions::push_error("LlamaChat: no model is loaded.");
         return false;
     }
+    if (slot < 0 || slot >= (int)slots.size()) {
+        UtilityFunctions::push_error(vformat("LlamaChat: slot %d is not one of the %d this "
+                "context was opened with; they are numbered from zero.", slot, (int)slots.size()));
+        return false;
+    }
 
     LlamaTurn turn;
+    turn.slot = slot;
     String error;
     if (!read_messages(messages, turn.inputs.messages, error) || !read_tools(tools, turn.inputs.tools, error)) {
         UtilityFunctions::push_error("LlamaChat: " + error);
@@ -702,8 +733,12 @@ bool LlamaChat::wait_for_turn(int timeout_ms) {
     }
 }
 
-Dictionary LlamaChat::last_timings() const {
+Dictionary LlamaChat::last_timings(int slot) const {
     Dictionary out;
+    if (slot < 0 || slot >= (int)slots.size()) {
+        return out;
+    }
+    const LlamaTimings &timings = slots[slot]->timings;
     out["load_ms"] = timings.load_ms;
     out["template_ms"] = timings.template_ms;
     out["prompt_ms"] = timings.prompt_ms;
@@ -728,8 +763,62 @@ int LlamaChat::context_size() const {
     return context_tokens;
 }
 
-int LlamaChat::cached_tokens() const {
-    return kv_tokens.load();
+int LlamaChat::cached_tokens(int slot) const {
+    if (slot < 0 || slot >= (int)slots.size()) {
+        return 0;
+    }
+    return slots[slot]->kv_tokens.load();
+}
+
+
+// How many conversations the open context holds, or how many the next load asks for where
+// none is open. A host sizes its own pool by this and never by the number it asked for.
+int LlamaChat::slot_count() const {
+    return slots.empty() ? slots_asked : (int)slots.size();
+}
+
+
+// A slot is free when the cache carries nothing of it: one that was never used, one that was
+// dropped, and one whose drop is owed. Which conversation owns which slot is the host's book.
+int LlamaChat::free_slots() const {
+    if (slots.empty()) {
+        return slots_asked;
+    }
+    int free = 0;
+    for (const std::unique_ptr<LlamaSlot> &slot : slots) {
+        if (slot->kv_tokens.load() == 0 || slot->drop_asked.load()) {
+            free++;
+        }
+    }
+    return free;
+}
+
+
+// Clears one slot now where nothing is decoding, and leaves the clear owed where something is:
+// the cache may not be touched beside a running worker, and a caller that waited for one would
+// hold the frame for a whole turn. The next turn honours what is owed before it decodes.
+String LlamaChat::drop_slot(int slot) {
+    if (slot < 0 || slot >= (int)slots.size()) {
+        return vformat("LlamaChat: slot %d is not one of the %d this context was opened with; "
+                "they are numbered from zero.", slot, (int)slots.size());
+    }
+    std::unique_lock<std::mutex> hold(model_lock, std::try_to_lock);
+    if (!hold.owns_lock()) {
+        slots[slot]->drop_asked.store(true);
+        return String();
+    }
+    clear_slot(slot);
+    return String();
+}
+
+
+void LlamaChat::clear_slot(int slot) {
+    if (ctx != nullptr) {
+        llama_memory_seq_rm(llama_get_memory(ctx), (llama_seq_id)slot, -1, -1);
+    }
+    slots[slot]->cached.clear();
+    slots[slot]->kv_tokens.store(0);
+    slots[slot]->drop_asked.store(false);
 }
 
 Array LlamaChat::describe_devices() {
@@ -784,8 +873,9 @@ void LlamaChat::work(LlamaTurn turn, int64_t at) {
     llama_runtime::note_operation("LlamaChat was waiting for a turn");
 }
 
-// One turn: render, tokenize, drop the context past the first token that differs from what
-// it holds, decode the rest, then sample under the template's grammar until the model stops,
+// One turn in one slot: render, tokenize, drop that sequence past the first token that differs
+// from what it holds, decode the rest, then sample under the template's grammar until the model
+// stops,
 // the budget runs out or cancel() is seen. Every piece of visible text goes out as soon as
 // its last letter is whole; calls go out once the reply has ended cleanly.
 void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
@@ -794,13 +884,23 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
     };
 
     std::lock_guard<std::mutex> hold(model_lock);
-    if (!loaded.load() || at != epoch.load()) {
+    if (!loaded.load() || at != epoch.load() || turn.slot >= (int)slots.size()) {
         fail("LlamaChat: the model was unloaded before the turn started.");
         return;
     }
+    // What was dropped while a turn held the model is cleared here, before anything is compared
+    // against a slot's tokens: a prefix kept out of a cache the host has given back is a reply
+    // answering somebody else's conversation.
+    for (size_t i = 0; i < slots.size(); i++) {
+        if (slots[i]->drop_asked.load()) {
+            clear_slot((int)i);
+        }
+    }
+    LlamaSlot &slot = *slots[turn.slot];
+    const llama_seq_id sequence = (llama_seq_id)turn.slot;
     const auto started = clock_type::now();
     LlamaTimings cost;
-    cost.load_ms = timings.load_ms;
+    cost.load_ms = load_ms;
 
     common_chat_params chat;
     try {
@@ -817,27 +917,26 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
         return;
     }
     if ((int)prompt.size() + 1 > context_tokens) {
-        fail(vformat("LlamaChat: the prompt is %d tokens and the context holds %d.", (int)prompt.size(), context_tokens));
+        fail(vformat("LlamaChat: the prompt is %d tokens and this slot of the context holds %d.",
+                (int)prompt.size(), context_tokens));
         return;
     }
 
     // The prefix already decoded is kept; when the whole prompt is there the last token is
     // decoded again, because a turn needs the logits of its final token to sample from.
     size_t keep = 0;
-    while (keep < cached.size() && keep < prompt.size() && cached[keep] == prompt[keep]) {
+    while (keep < slot.cached.size() && keep < prompt.size() && slot.cached[keep] == prompt[keep]) {
         keep++;
     }
     if (keep == prompt.size()) {
         keep--;
     }
+    // This slot's own tokens and no others: clearing the whole cache here would empty the
+    // conversations beside it, which would then pay for their whole prompt again in silence.
     llama_memory_t memory = llama_get_memory(ctx);
-    if (keep == 0) {
-        llama_memory_clear(memory, true);
-    } else {
-        llama_memory_seq_rm(memory, SEQUENCE, (llama_pos)keep, -1);
-    }
-    cached.resize(keep);
-    kv_tokens.store((int)cached.size());
+    llama_memory_seq_rm(memory, sequence, (llama_pos)keep, -1);
+    slot.cached.resize(keep);
+    slot.kv_tokens.store((int)slot.cached.size());
     cost.prompt_tokens = (int)prompt.size();
     cost.reused_tokens = (int)keep;
     cost.decoded_tokens = (int)(prompt.size() - keep);
@@ -852,23 +951,23 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
     for (size_t from = keep; from < prompt.size();) {
         if (stop_asked.load()) {
             cost.total_ms = ms_between(started, clock_type::now());
-            timings = cost;
+            slot.timings = cost;
             post(finished_event(at, String("cancelled"), (int)prompt.size(), 0));
             return;
         }
         const size_t to = std::min(prompt.size(), from + (size_t)n_batch);
         common_batch_clear(batch);
         for (size_t i = from; i < to; i++) {
-            common_batch_add(batch, prompt[i], (llama_pos)i, { SEQUENCE }, i + 1 == prompt.size());
+            common_batch_add(batch, prompt[i], (llama_pos)i, { sequence }, i + 1 == prompt.size());
         }
         if (llama_decode(ctx, batch) != 0) {
-            fail("LlamaChat: the prompt could not be decoded; the context may be too small for it.");
+            fail("LlamaChat: the prompt could not be decoded; this slot of the context may be too small for it.");
             return;
         }
         for (size_t i = from; i < to; i++) {
-            cached.push_back(prompt[i]);
+            slot.cached.push_back(prompt[i]);
         }
-        kv_tokens.store((int)cached.size());
+        slot.kv_tokens.store((int)slot.cached.size());
         from = to;
     }
     cost.prompt_ms = ms_between(prompt_started, clock_type::now());
@@ -1020,7 +1119,7 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
             reason = "cancelled";
             break;
         }
-        if (produced >= turn.max_tokens || (int)cached.size() + 1 >= context_tokens) {
+        if (produced >= turn.max_tokens || (int)slot.cached.size() + 1 >= context_tokens) {
             reason = "length";
             break;
         }
@@ -1054,13 +1153,13 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
             }
         }
         common_batch_clear(batch);
-        common_batch_add(batch, token, (llama_pos)cached.size(), { SEQUENCE }, true);
+        common_batch_add(batch, token, (llama_pos)slot.cached.size(), { sequence }, true);
         if (llama_decode(ctx, batch) != 0) {
-            fail("LlamaChat: a generated token could not be decoded; the context is full.");
+            fail("LlamaChat: a generated token could not be decoded; this slot of the context is full.");
             return;
         }
-        cached.push_back(token);
-        kv_tokens.store((int)cached.size());
+        slot.cached.push_back(token);
+        slot.kv_tokens.store((int)slot.cached.size());
         if (stopped) {
             break;
         }
@@ -1083,7 +1182,7 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
     cost.completion_tokens = produced;
     cost.reasoning_tokens = reasoning_tokens;
     cost.total_ms = ms_between(started, clock_type::now());
-    timings = cost;
+    slot.timings = cost;
     post(finished_event(at, to_gd(reason), (int)prompt.size(), produced));
 }
 
@@ -1153,13 +1252,19 @@ void LlamaChat::_bind_methods() {
     ClassDB::bind_method(D_METHOD("unload"), &LlamaChat::unload);
     ClassDB::bind_method(D_METHOD("is_loaded"), &LlamaChat::is_loaded);
     ClassDB::bind_method(D_METHOD("is_busy"), &LlamaChat::is_busy);
-    ClassDB::bind_method(D_METHOD("generate", "messages", "tools", "options"), &LlamaChat::generate);
+    ClassDB::bind_method(D_METHOD("generate", "messages", "tools", "options", "slot"),
+            &LlamaChat::generate, DEFVAL(FIRST_SLOT));
     ClassDB::bind_method(D_METHOD("cancel"), &LlamaChat::cancel);
     ClassDB::bind_method(D_METHOD("deliver_pending"), &LlamaChat::deliver_pending);
     ClassDB::bind_method(D_METHOD("wait_for_turn", "timeout_ms"), &LlamaChat::wait_for_turn);
-    ClassDB::bind_method(D_METHOD("last_timings"), &LlamaChat::last_timings);
+    ClassDB::bind_method(D_METHOD("slot_count"), &LlamaChat::slot_count);
+    ClassDB::bind_method(D_METHOD("free_slots"), &LlamaChat::free_slots);
+    ClassDB::bind_method(D_METHOD("drop_slot", "slot"), &LlamaChat::drop_slot);
+    ClassDB::bind_method(D_METHOD("last_timings", "slot"), &LlamaChat::last_timings,
+            DEFVAL(FIRST_SLOT));
     ClassDB::bind_method(D_METHOD("context_size"), &LlamaChat::context_size);
-    ClassDB::bind_method(D_METHOD("cached_tokens"), &LlamaChat::cached_tokens);
+    ClassDB::bind_method(D_METHOD("cached_tokens", "slot"), &LlamaChat::cached_tokens,
+            DEFVAL(FIRST_SLOT));
     ClassDB::bind_method(D_METHOD("memory_report"), &LlamaChat::memory_report);
     ClassDB::bind_method(D_METHOD("device_memory"), &LlamaChat::device_memory);
     ClassDB::bind_method(D_METHOD("describe_devices"), &LlamaChat::describe_devices);
