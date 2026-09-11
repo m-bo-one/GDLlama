@@ -511,13 +511,17 @@ bool LlamaChat::load(const String &model_path, int n_ctx, int n_threads, int n_g
     // After the warm-up and not before: the compute buffers are sized by the widest batch the
     // model is decoded at, and that is the batch the warm-up above has just put through it.
     remember_what_it_holds();
+    // The readers answer their empty value while this stands: the vector is being rebuilt here,
+    // and one of them indexing it mid-rebuild reads a slot that is no longer there.
+    rebuilding.store(true);
     slots.clear();
     load_ms = ms_between(started, clock_type::now());
     const int opened = std::max(1, (int)llama_n_seq_max(ctx));
     for (int i = 0; i < opened; i++) {
-        slots.push_back(std::unique_ptr<LlamaSlot>(new LlamaSlot()));
+        slots.push_back(std::make_unique<LlamaSlot>());
         slots.back()->timings.load_ms = load_ms;
     }
+    rebuilding.store(false);
     loaded.store(true);
     llama_runtime::note_operation("LlamaChat was waiting for a turn");
     return true;
@@ -739,7 +743,7 @@ bool LlamaChat::wait_for_turn(int timeout_ms) {
 
 Dictionary LlamaChat::last_timings(int slot) const {
     Dictionary out;
-    if (slot < 0 || slot >= (int)slots.size()) {
+    if (rebuilding.load() || slot < 0 || slot >= (int)slots.size()) {
         return out;
     }
     const LlamaTimings &timings = slots[slot]->timings;
@@ -768,35 +772,51 @@ int LlamaChat::context_size() const {
 }
 
 int LlamaChat::cached_tokens(int slot) const {
-    if (slot < 0 || slot >= (int)slots.size()) {
+    if (rebuilding.load() || slot < 0 || slot >= (int)slots.size()) {
         return 0;
     }
     return slots[slot]->kv_tokens.load();
 }
 
-
-// How many conversations the open context holds, or how many the next load asks for where
-// none is open. A host sizes its own pool by this and never by the number it asked for.
+// How many conversations the open context holds, or how many the next load asks for where none
+// is open. The vector outlives an unload so the last turn's cost stays readable, so what is
+// loaded decides which of the two is answered rather than whether the vector is empty.
 int LlamaChat::slot_count() const {
-    return slots.empty() ? slots_asked : (int)slots.size();
-}
-
-
-// A slot is free when the cache carries nothing of it: one that was never used, one that was
-// dropped, and one whose drop is owed. Which conversation owns which slot is the host's book.
-int LlamaChat::free_slots() const {
-    if (slots.empty()) {
+    if (!loaded.load() || rebuilding.load() || slots.empty()) {
         return slots_asked;
     }
-    int free = 0;
-    for (const std::unique_ptr<LlamaSlot> &slot : slots) {
-        if (slot->kv_tokens.load() == 0 || slot->drop_asked.load()) {
-            free++;
-        }
-    }
-    return free;
+    return (int)slots.size();
 }
 
+// How many sequences carry nothing at all: one that was never used, one that was dropped, and
+// one whose drop is owed. It is about the cache and not about who is seated where -- which
+// conversation owns which slot is the host's own book, kept outside this class.
+int LlamaChat::empty_slots() const {
+    if (!loaded.load() || rebuilding.load() || slots.empty()) {
+        return slots_asked;
+    }
+    int empty = 0;
+    for (const std::unique_ptr<LlamaSlot> &slot : slots) {
+        if (slot->kv_tokens.load() == 0 || slot->drop_asked.load()) {
+            empty++;
+        }
+    }
+    return empty;
+}
+
+// What every slot carrying tokens holds, as one phrase, so a sentence about a context that is
+// full says which conversation to close rather than only that something filled it.
+String LlamaChat::what_the_slots_hold() const {
+    String said;
+    for (size_t i = 0; i < slots.size(); i++) {
+        const int held = slots[i]->kv_tokens.load();
+        if (held > 0) {
+            said += (said.is_empty() ? String() : String(", "))
+                    + vformat("slot %d: %d tokens", (int)i, held);
+        }
+    }
+    return said.is_empty() ? String("nothing") : said;
+}
 
 // Clears one slot now where nothing is decoding, and leaves the clear owed where something is:
 // the cache may not be touched beside a running worker, and a caller that waited for one would
@@ -879,17 +899,12 @@ void LlamaChat::work(LlamaTurn turn, int64_t at) {
 
 // One turn in one slot: render, tokenize, drop that sequence past the first token that differs
 // from what it holds, decode the rest, then sample under the template's grammar until the model
-// stops,
-// the budget runs out or cancel() is seen. Every piece of visible text goes out as soon as
-// its last letter is whole; calls go out once the reply has ended cleanly.
+// stops, the budget runs out or cancel() is seen. Every piece of visible text goes out as soon
+// as its last letter is whole; calls go out once the reply has ended cleanly.
 void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
-    auto fail = [&](const String &message) {
-        post(failed_event(at, message));
-    };
-
     std::lock_guard<std::mutex> hold(model_lock);
     if (!loaded.load() || at != epoch.load() || turn.slot >= (int)slots.size()) {
-        fail("LlamaChat: the model was unloaded before the turn started.");
+        post(failed_event(at, "LlamaChat: the model was unloaded before the turn started."));
         return;
     }
     // What was dropped while a turn held the model is cleared here, before anything is compared
@@ -905,6 +920,15 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
     const auto started = clock_type::now();
     LlamaTimings cost;
     cost.load_ms = load_ms;
+
+    // A refused turn writes down what it reached before it says so: what the last turn in this
+    // slot cost is read right after a refusal, and a row left from the turn before is then a
+    // measurement of something else, reported as this one's.
+    auto fail = [&](const String &message) {
+        cost.total_ms = ms_between(started, clock_type::now());
+        slot.timings = cost;
+        post(failed_event(at, message));
+    };
 
     common_chat_params chat;
     try {
@@ -923,6 +947,22 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
     if ((int)prompt.size() + 1 > context_tokens) {
         fail(vformat("LlamaChat: the prompt is %d tokens and the context holds %d, which the %d "
                 "slot(s) share.", (int)prompt.size(), context_tokens, (int)slots.size()));
+        return;
+    }
+    // The slots draw on one budget, so what this turn may have is the context less what the
+    // others are holding. Measured in front of the decode: inside it the library writes its own
+    // line to stderr and the failure a host is handed carries no number at all.
+    int held_elsewhere = 0;
+    for (size_t i = 0; i < slots.size(); i++) {
+        if ((int)i != turn.slot) {
+            held_elsewhere += slots[i]->kv_tokens.load();
+        }
+    }
+    if ((int)prompt.size() + 1 + held_elsewhere > context_tokens) {
+        fail(vformat("LlamaChat: the prompt is %d tokens, the other slot(s) hold %d, and the "
+                "context holds %d, which they share. Give a finished conversation's slot back, "
+                "or raise the context.",
+                (int)prompt.size(), held_elsewhere, context_tokens));
         return;
     }
 
@@ -965,8 +1005,9 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
             common_batch_add(batch, prompt[i], (llama_pos)i, { sequence }, i + 1 == prompt.size());
         }
         if (llama_decode(ctx, batch) != 0) {
-            fail("LlamaChat: the prompt could not be decoded; the context may be too small for "
-                 "it, or too much of it is held by the other slots.");
+            fail(vformat("LlamaChat: the prompt could not be decoded; the context of %d tokens "
+                    "is full. The slots hold %s. Give a finished conversation's slot back, or "
+                    "raise the context.", context_tokens, what_the_slots_hold()));
             return;
         }
         for (size_t i = from; i < to; i++) {
@@ -1160,8 +1201,9 @@ void LlamaChat::run_turn(const LlamaTurn &turn, int64_t at) {
         common_batch_clear(batch);
         common_batch_add(batch, token, (llama_pos)slot.cached.size(), { sequence }, true);
         if (llama_decode(ctx, batch) != 0) {
-            fail("LlamaChat: a generated token could not be decoded; the context is full, "
-                 "whether with this conversation or with the slots beside it.");
+            fail(vformat("LlamaChat: a generated token could not be decoded; the context of %d "
+                    "tokens is full. The slots hold %s. Give a finished conversation's slot "
+                    "back, or raise the context.", context_tokens, what_the_slots_hold()));
             return;
         }
         slot.cached.push_back(token);
@@ -1264,7 +1306,7 @@ void LlamaChat::_bind_methods() {
     ClassDB::bind_method(D_METHOD("deliver_pending"), &LlamaChat::deliver_pending);
     ClassDB::bind_method(D_METHOD("wait_for_turn", "timeout_ms"), &LlamaChat::wait_for_turn);
     ClassDB::bind_method(D_METHOD("slot_count"), &LlamaChat::slot_count);
-    ClassDB::bind_method(D_METHOD("free_slots"), &LlamaChat::free_slots);
+    ClassDB::bind_method(D_METHOD("empty_slots"), &LlamaChat::empty_slots);
     ClassDB::bind_method(D_METHOD("drop_slot", "slot"), &LlamaChat::drop_slot);
     ClassDB::bind_method(D_METHOD("last_timings", "slot"), &LlamaChat::last_timings,
             DEFVAL(FIRST_SLOT));

@@ -144,7 +144,12 @@ class LlamaChat : public RefCounted {
     // One entry per slot, built at the load and kept across an unload so what the last turn
     // cost can still be read. A turn compares its prompt against its own slot's tokens and
     // decodes only the tail past the first difference.
+    //
+    // The flag stands while the load rebuilds the vector. The readers below take no model lock
+    // -- a turn holds it for its whole length and a reader that waited would hold the frame with
+    // it -- so they answer their empty value while it stands rather than indexing a moving list.
     std::vector<std::unique_ptr<LlamaSlot>> slots;
+    std::atomic<bool> rebuilding{false};
 
     // How many sequences the next load opens the context with, and how many the open one has.
     // The slots share one cache of the context's tokens, so context_tokens below is the whole
@@ -229,10 +234,11 @@ public:
     bool generate(const Array &messages, const Array &tools, const Dictionary &options, int slot = 0);
     void cancel();
 
-    // How many conversations the context holds at once, and how many of those carry no tokens
-    // at all. A caller hands turns out by these two and by nothing else.
+    // How many conversations the context holds at once, and how many of its sequences carry no
+    // tokens at all. The second is about the cache alone: which conversation owns which slot is
+    // the host's own book, kept outside this class, and nothing here can answer it.
     int slot_count() const;
-    int free_slots() const;
+    int empty_slots() const;
 
     // Clears one slot's tokens out of the cache, so the next turn there starts from nothing.
     // Answers "" when it was done or is owed, and the sentence saying why when the slot is not
@@ -283,6 +289,8 @@ private:
     static bool ensure_backends();
 
     void remember_what_it_holds();
+    // What each occupied sequence carries, for a sentence about a full context to name.
+    godot::String what_the_slots_hold() const;
     // Clears one slot out of the cache. Called with the model lock held, and never otherwise:
     // touching the cache beside a decoding worker is what it is there to prevent.
     void clear_slot(int slot);
