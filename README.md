@@ -60,10 +60,9 @@ chat.generate(messages, tools, {"temperature": 0.7, "top_p": 0.8, "max_tokens": 
 - `wait_for_turn(timeout_ms) -> bool` — blocks, draining as it waits, until the turn in
   flight has been handed out or the wait runs out. For frameless callers only.
 - `slot_count()` — how many sequences the open context has, or how many the next load asks
-  for; `empty_slots()` — how many of them carry no tokens at all, which is about the cache and
-  not about who is seated where: which conversation owns which slot is the caller's own book.
+  for. Which conversation owns which slot is the caller's own book and nothing here answers it.
   `drop_slot(slot)` clears one sequence's tokens, so the next turn there starts from nothing;
-  a slot dropped while a turn runs is cleared in front of the next one.
+  a slot dropped while a turn runs is cleared behind it, or in front of the next one.
 - `unload()`, `is_loaded()`, `is_busy()`, `context_size()`, `cached_tokens(slot)`,
   `last_timings(slot)`, `describe_devices()`, `LlamaChat.set_verbose(on)`.
 - Signals, all on the main thread and in the order the worker produced them:
@@ -95,8 +94,16 @@ comes back whole.
 (the part of them the thought took, counted whether or not a budget was given, and readable
 from the `finished` handler because the turn's cost is written before the signal goes out),
 `tokens_per_second`, `prompt_tokens_per_second`, `device`, `context_size`. It is per slot, and
-a refused turn writes its row as well — what it reached before it was refused — so a reading
-taken after a refusal is that turn's and never the one before it.
+a turn refused inside its own slot writes its row as well — what it reached before it was
+refused, its prompt's size included — so a reading taken after such a refusal is that turn's
+and never the one before it. The two refusals above the slot, where the model was unloaded or
+replaced while the turn waited, write no row: there is no slot of theirs to write it to.
+
+A refused decode says which of the library's answers it got. Only `1` — a context with no room
+left — is the caller's to act on, and only it advises dropping a slot; `2` says the decode was
+aborted and that what the slot held was cleared with it; `-1` says the library refused the
+batch itself, which is this class's own fault; anything below that names the number and points
+at the editor log.
 
 ## Building on Windows (MSVC + Ninja)
 

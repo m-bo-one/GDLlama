@@ -22,8 +22,8 @@
 namespace godot {
 
 // One turn as the worker receives it: the messages and tools already in llama.cpp's own
-// shape, and the sampling knobs. Gathered on the caller's thread so the worker never reads
-// a Variant, which is what keeps the engine's reference counting off that thread.
+// shape, and the sampling knobs. Gathered on the caller's thread so no Variant a caller owns
+// ever crosses to the worker, and no signal is ever emitted from it.
 struct LlamaTurn {
     common_chat_templates_inputs inputs;
     float temperature = 0.7f;
@@ -85,7 +85,7 @@ struct LlamaEvent {
 
 // One slot of the context: the tokens that sequence holds, in order, how many of them the
 // cache carries, whether a clear is owed, and what the last turn run there cost. Held behind a
-// pointer so the list of them can be rebuilt at a load without moving an atomic.
+// pointer so the list of them never has to move an atomic, and never has to move at all.
 struct LlamaSlot {
     std::vector<llama_token> cached;
     std::atomic<int> kv_tokens{0};
@@ -141,24 +141,36 @@ class LlamaChat : public RefCounted {
     const llama_vocab *vocab = nullptr;
     common_chat_templates_ptr templates;
 
-    // One entry per slot, built at the load and kept across an unload so what the last turn
-    // cost can still be read. A turn compares its prompt against its own slot's tokens and
-    // decodes only the tail past the first difference.
+    // One entry per sequence the library will ever open, built once in the constructor and
+    // never cleared, resized or reallocated: slots.size() is llama_max_parallel_sequences()
+    // and says nothing about this context. A turn compares its prompt against its own slot's
+    // tokens and decodes only the tail past the first difference.
     //
-    // The flag stands while the load rebuilds the vector. The readers below take no model lock
-    // -- a turn holds it for its whole length and a reader that waited would hold the frame with
-    // it -- so they answer their empty value while it stands rather than indexing a moving list.
+    // How many of them are live is `opened`, and every reader below takes one snapshot of it
+    // and bounds itself by that copy. The readers take no model lock -- a turn holds it for its
+    // whole length and a reader that waited would hold the frame with it -- so one that lands
+    // mid-load reads zero and answers its empty value; one that lands either side indexes an
+    // element nothing in this class ever frees.
     std::vector<std::unique_ptr<LlamaSlot>> slots;
-    std::atomic<bool> rebuilding{false};
+    std::atomic<int> opened{0};
+
+    // Read by the main thread while the worker writes it: what every turn leaves in its slot's
+    // timings, and the device name the load writes. Small enough to be held across eleven field
+    // copies and one string copy, and never held across a decode or across a load.
+    mutable std::mutex readers_lock;
 
     // How many sequences the next load opens the context with, and how many the open one has.
     // The slots share one cache of the context's tokens, so context_tokens below is the whole
     // of it and what a conversation may hold is bounded by what the others are holding.
-    int slots_asked = 1;
+    //
+    // The four are written on the caller's thread or the loader's and read on the worker's and
+    // the main one, so they are atomics rather than plain ints: a reading taken across a write
+    // here is a context of the wrong size.
+    std::atomic<int> slots_asked{1};
 
-    int context_tokens = 0;
-    int n_batch = 512;
-    int n_ubatch = 512;
+    std::atomic<int> context_tokens{0};
+    std::atomic<int> n_batch{512};
+    std::atomic<int> n_ubatch{512};
 
     // A sliding window that keeps every position rather than the model's own thousand. On a
     // model with such layers the short window silently empties whenever a turn generated more
@@ -177,6 +189,10 @@ class LlamaChat : public RefCounted {
     // The device this model was put on, as ggml names it, or "cpu". Per object rather than
     // per process: a second model may be loaded on another device beside this one. The handle
     // beside it is what the crash line reads its free memory from; null means the processor.
+    //
+    // Written by the loader thread and read by the main one, so both ends are under
+    // readers_lock: a std::string assignment that reallocates under a reader is a read of
+    // freed memory, which no atomic on the four counts below would have caught.
     std::string chosen_device;
     ggml_backend_dev_t device = nullptr;
 
@@ -189,7 +205,9 @@ class LlamaChat : public RefCounted {
     std::atomic<int64_t> host_bytes{0};
 
     // What the load itself took, copied into every slot's timings so a turn reports it too.
-    double load_ms = 0.0;
+    // Written on the loader thread and read on the worker's and the main one, so it is an
+    // atomic of its own rather than a field of the struct the lock above covers.
+    std::atomic<double> load_ms{0.0};
 
 protected:
     static void _bind_methods();
@@ -205,7 +223,9 @@ public:
     // none. A host holds it against the other library's answer: one address is one card.
     godot::String device_identity() const;
 
-    LlamaChat() = default;
+    // Builds the storage for every sequence the library will ever open, so no load ever has to
+    // replace it under a reader. What it costs is one allocation per entry, once per object.
+    LlamaChat();
     ~LlamaChat();
 
     // What the next load opens the context with, beyond its four numbers: slots, swa_full,
@@ -231,19 +251,19 @@ public:
     // enable_thinking, parallel_tool_calls, json_schema and the penalties above. The slot is
     // which conversation of the context answers; false when the model is not loaded, a turn is
     // running, the slot is not one the context has, or the messages do not read.
-    bool generate(const Array &messages, const Array &tools, const Dictionary &options, int slot = 0);
+    bool generate(const Array &messages, const Array &tools, const Dictionary &options, int64_t slot = 0);
     void cancel();
 
-    // How many conversations the context holds at once, and how many of its sequences carry no
-    // tokens at all. The second is about the cache alone: which conversation owns which slot is
+    // How many conversations the context holds at once. Which conversation owns which slot is
     // the host's own book, kept outside this class, and nothing here can answer it.
     int slot_count() const;
-    int empty_slots() const;
 
     // Clears one slot's tokens out of the cache, so the next turn there starts from nothing.
-    // Answers "" when it was done or is owed, and the sentence saying why when the slot is not
-    // one the context has. A slot dropped while a turn runs is cleared before the next one.
-    String drop_slot(int slot);
+    // Answers "" when it was done or is owed, and the sentence saying why when nothing is
+    // loaded or the slot is not one the context has. A slot dropped while a turn runs is
+    // cleared behind that turn, or in front of the next one. The index is taken whole: a number
+    // GDScript holds as 64 bits narrowed here would clear a conversation nobody named.
+    String drop_slot(int64_t slot);
 
     // Hands out every signal the worker has queued, on the calling thread, in order. The
     // engine calls it deferred after each burst; a caller that draws no frames calls it.
@@ -289,11 +309,16 @@ private:
     static bool ensure_backends();
 
     void remember_what_it_holds();
-    // What each occupied sequence carries, for a sentence about a full context to name.
-    godot::String what_the_slots_hold() const;
+    // What each occupied sequence carries, for a sentence about a full context to name. The
+    // count is the caller's own snapshot of `opened`, so one sentence reads one list.
+    godot::String what_the_slots_hold(int count) const;
     // Clears one slot out of the cache. Called with the model lock held, and never otherwise:
     // touching the cache beside a decoding worker is what it is there to prevent.
     void clear_slot(int slot);
+    // Clears every slot whose drop was asked for while a turn held the model. Called with the
+    // lock held, in front of a turn and again behind it, so a seat given back during the last
+    // turn of a scene is cleared without waiting for a turn that may never come.
+    void drain_owed_drops(int count);
     void warm_up(bool every_width);
     void work(LlamaTurn turn, int64_t at);
     void run_turn(const LlamaTurn &turn, int64_t at);
