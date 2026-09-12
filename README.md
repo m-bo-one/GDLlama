@@ -64,7 +64,9 @@ chat.generate(messages, tools, {"temperature": 0.7, "top_p": 0.8, "max_tokens": 
   `drop_slot(slot)` clears one sequence's tokens, so the next turn there starts from nothing;
   a slot dropped while a turn runs is cleared behind it, or in front of the next one.
 - `unload()`, `is_loaded()`, `is_busy()`, `context_size()`, `cached_tokens(slot)`,
-  `last_timings(slot)`, `describe_devices()`, `LlamaChat.set_verbose(on)`.
+  `last_timings(slot)`, `describe_devices()`, `LlamaChat.set_verbose(on)`. The two that take a
+  slot read the number whole: one the open context has not is refused with the sentence
+  `generate()` and `drop_slot()` use, and answered with no tokens and an empty reading.
 - Signals, all on the main thread and in the order the worker produced them:
   `piece_arrived(text)` — visible text only, whole UTF-8 letters;
   `tool_called(id, name, arguments_json)` — after the reply ended cleanly;

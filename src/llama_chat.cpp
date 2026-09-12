@@ -815,10 +815,16 @@ bool LlamaChat::wait_for_turn(int timeout_ms) {
     }
 }
 
-Dictionary LlamaChat::last_timings(int slot) const {
+Dictionary LlamaChat::last_timings(int64_t slot) const {
     Dictionary out;
     const int count = opened.load(std::memory_order_acquire);
-    if (slot < 0 || slot >= count) {
+    // Nothing open has no sequence to name, and the empty reading is the answer there rather
+    // than a refusal; an index the open context has not is refused whole, as a turn is.
+    if (count == 0) {
+        return out;
+    }
+    if (slot < 0 || slot >= (int64_t)count) {
+        UtilityFunctions::push_error(not_one_of_the_slots(slot, count));
         return out;
     }
     // Copied out under the lock and read from the copy: the worker writes the eleven fields one
@@ -827,7 +833,7 @@ Dictionary LlamaChat::last_timings(int slot) const {
     std::string device_name;
     {
         std::lock_guard<std::mutex> hold(readers_lock);
-        timings = slots[slot]->timings;
+        timings = slots[(int)slot]->timings;
         device_name = chosen_device;
     }
     out["load_ms"] = timings.load_ms;
@@ -854,12 +860,16 @@ int LlamaChat::context_size() const {
     return context_tokens.load();
 }
 
-int LlamaChat::cached_tokens(int slot) const {
+int LlamaChat::cached_tokens(int64_t slot) const {
     const int count = opened.load(std::memory_order_acquire);
-    if (slot < 0 || slot >= count) {
+    if (count == 0) {
         return 0;
     }
-    return slots[slot]->kv_tokens.load();
+    if (slot < 0 || slot >= (int64_t)count) {
+        UtilityFunctions::push_error(not_one_of_the_slots(slot, count));
+        return 0;
+    }
+    return slots[(int)slot]->kv_tokens.load();
 }
 
 // How many conversations the open context holds, or how many the next load asks for where none

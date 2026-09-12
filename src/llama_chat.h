@@ -277,9 +277,14 @@ public:
     // What the last turn of one slot cost, and how many tokens of it the cache holds. The
     // context size is the whole context, which is what a prompt is measured against: the slots
     // share those tokens rather than each being given a fixed part of them.
-    Dictionary last_timings(int slot = 0) const;
+    //
+    // Both take the index whole, as generate() and drop_slot() do, and refuse one the context
+    // has not with the same sentence: a number GDScript holds as 64 bits narrowed here would
+    // answer with the row and the cache of a conversation nobody named. Before a load there is
+    // no sequence to name and both answer their empty value without a word.
+    Dictionary last_timings(int64_t slot = 0) const;
     int context_size() const;
-    int cached_tokens(int slot = 0) const;
+    int cached_tokens(int64_t slot = 0) const;
 
     // What this model holds, as the library counted it when the load finished: weights_bytes,
     // kv_bytes, compute_bytes, and host_bytes for the part of the three that is ordinary memory
